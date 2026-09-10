@@ -84,6 +84,24 @@ impl eframe::App for HakoniwaApp {
             ui.label(&self.status);
         });
         ui.separator();
+        let panel_rect = ui.available_rect_before_wrap();
+        let boundary_color = egui::Color32::from_gray(82);
+        let first_boundary = panel_rect.left() + panel_rect.width() / 3.0;
+        let second_boundary = panel_rect.left() + panel_rect.width() * 2.0 / 3.0;
+        ui.painter().line_segment(
+            [
+                egui::pos2(first_boundary, panel_rect.top()),
+                egui::pos2(first_boundary, panel_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, boundary_color),
+        );
+        ui.painter().line_segment(
+            [
+                egui::pos2(second_boundary, panel_rect.top()),
+                egui::pos2(second_boundary, panel_rect.bottom()),
+            ],
+            egui::Stroke::new(1.0, boundary_color),
+        );
         ui.columns(3, |columns| {
             columns[0].heading("パーツツリー");
             for (id, piece) in &self.project.pieces {
