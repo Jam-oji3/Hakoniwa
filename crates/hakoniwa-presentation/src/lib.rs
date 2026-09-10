@@ -7,6 +7,9 @@ pub struct HakoniwaApp {
     status: String,
     yaw: f32,
     zoom: f32,
+    pitch: f32,
+    pan: egui::Vec2,
+    perspective: bool,
 }
 impl HakoniwaApp {
     fn new(ctx: &egui::Context) -> Self {
@@ -35,6 +38,9 @@ impl HakoniwaApp {
             status: "ハンマーのMVPサンプルを読み込みました".into(),
             yaw: 45.0,
             zoom: 1.0,
+            pitch: 25.0,
+            pan: egui::Vec2::ZERO,
+            perspective: true,
         }
     }
 }
@@ -127,6 +133,9 @@ impl eframe::App for HakoniwaApp {
                 &self.project,
                 &mut self.yaw,
                 &mut self.zoom,
+                &mut self.pitch,
+                &mut self.pan,
+                &mut self.perspective,
             );
         });
     }
@@ -138,7 +147,7 @@ fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
         return;
     };
     ui.label(format!("{} · {:?}", piece.name, piece.plane));
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(250));
     for i in 0..11 {
@@ -164,8 +173,17 @@ fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
         );
     }
 }
-fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut f32) {
+fn draw_preview(
+    ui: &mut egui::Ui,
+    project: &Project,
+    yaw: &mut f32,
+    zoom: &mut f32,
+    pitch: &mut f32,
+    pan: &mut egui::Vec2,
+    perspective: &mut bool,
+) {
     ui.heading("3D Assembly ビュー");
+    ui.checkbox(perspective, "透視投影");
     ui.horizontal(|ui| {
         ui.label("カメラ回転");
         ui.add(egui::Slider::new(yaw, 0.0..=360.0).suffix("°"));
@@ -174,11 +192,16 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut 
         ui.label("ズーム");
         ui.add(egui::Slider::new(zoom, 0.5..=2.0));
     });
-    let (rect, response) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::drag());
+    let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
     if response.hovered() {
         ui.input(|input| {
             if input.pointer.button_down(egui::PointerButton::Middle) {
-                *yaw = (*yaw + input.pointer.delta().x * 0.5).rem_euclid(360.0);
+                if input.modifiers.shift {
+                    *pan += input.pointer.delta();
+                } else {
+                    *yaw = (*yaw + input.pointer.delta().x * 0.5).rem_euclid(360.0);
+                    *pitch = (*pitch - input.pointer.delta().y * 0.5).clamp(-85.0, 85.0);
+                }
             }
             if input.smooth_scroll_delta.y != 0.0 {
                 *zoom = (*zoom * (1.0 + input.smooth_scroll_delta.y * 0.001)).clamp(0.5, 2.0);
@@ -201,16 +224,39 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut 
                 *color,
                 *yaw,
                 *zoom,
+                *pitch,
+                *pan,
+                *perspective,
                 &occupied,
             );
         }
     }
 }
-fn project(center: egui::Pos2, x: f32, y: f32, z: f32, yaw: f32, zoom: f32) -> egui::Pos2 {
-    let a = yaw.to_radians();
+fn project(
+    center: egui::Pos2,
+    x: f32,
+    y: f32,
+    z: f32,
+    yaw: f32,
+    pitch: f32,
+    zoom: f32,
+    pan: egui::Vec2,
+    perspective: bool,
+) -> egui::Pos2 {
+    let yaw = yaw.to_radians();
+    let pitch = pitch.to_radians();
+    let rx = x * yaw.cos() - y * yaw.sin();
+    let ry = x * yaw.sin() + y * yaw.cos();
+    let screen_y = ry * pitch.cos() - z * pitch.sin();
+    let depth = ry * pitch.sin() + z * pitch.cos();
+    let scale = if perspective {
+        (1.0 / (1.0 + depth * 0.08)).clamp(0.55, 1.8)
+    } else {
+        1.0
+    };
     egui::pos2(
-        center.x + (x * a.cos() - y * a.sin()) * 20.0 * zoom,
-        center.y + (x * a.sin() + y * a.cos()) * 9.0 * zoom - z * 20.0 * zoom,
+        center.x + pan.x + rx * 20.0 * zoom * scale,
+        center.y + pan.y + screen_y * 20.0 * zoom * scale,
     )
 }
 fn draw_face(p: &egui::Painter, points: Vec<egui::Pos2>, color: egui::Color32) {
@@ -227,12 +273,27 @@ fn draw_voxel(
     color: Color,
     yaw: f32,
     zoom: f32,
+    pitch: f32,
+    pan: egui::Vec2,
+    perspective: bool,
     occupied: &BTreeSet<GridPosition>,
 ) {
     let x = pos.x as f32;
     let y = pos.y as f32;
     let z = pos.z as f32;
-    let v = |dx, dy, dz| project(center, x + dx, y + dy, z + dz, yaw, zoom);
+    let v = |dx, dy, dz| {
+        project(
+            center,
+            x + dx,
+            y + dy,
+            z + dz,
+            yaw,
+            pitch,
+            zoom,
+            pan,
+            perspective,
+        )
+    };
     let a = yaw.to_radians();
     let sx = if a.sin() >= 0.0 { 1 } else { -1 };
     let sy = if a.cos() >= 0.0 { 1 } else { -1 };
