@@ -1,22 +1,43 @@
 use eframe::egui;
 use hakoniwa_domain::{Bead, Color, GridPosition, Piece, Plane, Project};
+use std::sync::Arc;
 
 pub struct HakoniwaApp {
     project: Project,
     selected: Option<u64>,
     status: String,
+    yaw: f32,
+    zoom: f32,
 }
-
-impl Default for HakoniwaApp {
-    fn default() -> Self {
+impl HakoniwaApp {
+    fn new(ctx: &egui::Context) -> Self {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "noto-jp".into(),
+            Arc::new(egui::FontData::from_static(include_bytes!(
+                "../../../assets/NotoSansCJKjp-Regular.otf"
+            ))),
+        );
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "noto-jp".into());
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .insert(0, "noto-jp".into());
+        ctx.set_fonts(fonts);
         Self {
             project: hammer_project(),
             selected: None,
             status: "ハンマーのMVPサンプルを読み込みました".into(),
+            yaw: 45.0,
+            zoom: 1.0,
         }
     }
 }
-
 fn hammer_project() -> Project {
     let mut project = Project::new("ハンマー");
     let head = project.create_shape("頭部");
@@ -53,7 +74,6 @@ fn hammer_project() -> Project {
         .unwrap();
     project
 }
-
 impl eframe::App for HakoniwaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         ui.horizontal(|ui| {
@@ -78,12 +98,18 @@ impl eframe::App for HakoniwaApp {
                     self.selected = Some(*id);
                 }
             }
-            columns[0].label(format!("総ビーズ数: {}", self.project.bead_count()));
+            columns[0].separator();
+            columns[0].label(format!("総ビーズ数: {}", self.project.inventory().total));
             draw_editor(
                 &mut columns[1],
                 self.project.pieces.get(&self.selected.unwrap_or(0)),
             );
-            draw_preview(&mut columns[2], &self.project);
+            draw_preview(
+                &mut columns[2],
+                &self.project,
+                &mut self.yaw,
+                &mut self.zoom,
+            );
         });
     }
 }
@@ -97,53 +123,89 @@ fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
     let (rect, _) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
-    for x in 0..11 {
-        let p = rect.left() + x as f32 * 30.0;
+    for i in 0..11 {
+        let x = rect.left() + i as f32 * 30.0;
+        let y = rect.top() + i as f32 * 30.0;
         painter.line_segment(
-            [egui::pos2(p, rect.top()), egui::pos2(p, rect.bottom())],
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
             egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
         );
-    }
-    for y in 0..11 {
-        let p = rect.top() + y as f32 * 30.0;
         painter.line_segment(
-            [egui::pos2(rect.left(), p), egui::pos2(rect.right(), p)],
+            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
             egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
         );
     }
     for (pos, color) in &piece.beads {
-        let px = rect.center().x + pos.x as f32 * 30.0;
-        let py = rect.center().y - pos.y as f32 * 30.0;
         painter.circle_filled(
-            egui::pos2(px, py),
+            egui::pos2(
+                rect.center().x + pos.x as f32 * 30.0,
+                rect.center().y - pos.y as f32 * 30.0,
+            ),
             11.0,
             egui::Color32::from_rgb(color.0, color.1, color.2),
         );
     }
 }
-fn draw_preview(ui: &mut egui::Ui, project: &Project) {
-    ui.heading("3D Assembly プレビュー");
-    ui.label("直交面の簡易アイソメトリック表示");
+fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut f32) {
+    ui.heading("3D Assembly ビュー");
+    ui.horizontal(|ui| {
+        ui.label("回転");
+        ui.add(egui::Slider::new(yaw, 0.0..=360.0).suffix("°"));
+    });
+    ui.horizontal(|ui| {
+        ui.label("ズーム");
+        ui.add(egui::Slider::new(zoom, 0.5..=2.0));
+    });
     let (rect, _) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
+    let rad = yaw.to_radians();
     for piece in project.pieces.values() {
         for (p, c) in &piece.beads {
-            let x = rect.center().x + (p.x - p.y) as f32 * 16.0;
-            let y = rect.center().y + (p.x + p.y) as f32 * 8.0 - p.z as f32 * 16.0;
-            painter.circle_filled(
-                egui::pos2(x, y),
-                7.0,
-                egui::Color32::from_rgb(c.0, c.1, c.2),
+            let rx = p.x as f32 * rad.cos() - p.y as f32 * rad.sin();
+            let ry = p.x as f32 * rad.sin() + p.y as f32 * rad.cos();
+            let center = egui::pos2(
+                rect.center().x + rx * 20.0 * *zoom,
+                rect.center().y + ry * 10.0 * *zoom - p.z as f32 * 18.0 * *zoom,
             );
+            draw_cube(painter, center, 9.0 * *zoom, *c);
         }
     }
 }
-
+fn draw_cube(p: &egui::Painter, c: egui::Pos2, s: f32, col: Color) {
+    let base = egui::Color32::from_rgb(col.0, col.1, col.2);
+    let dark = egui::Color32::from_rgb(col.0 / 2, col.1 / 2, col.2 / 2);
+    let light = egui::Color32::from_rgb(
+        col.0.saturating_add(35),
+        col.1.saturating_add(35),
+        col.2.saturating_add(35),
+    );
+    let top = vec![
+        egui::pos2(c.x, c.y - s),
+        egui::pos2(c.x + s, c.y - s / 2.0),
+        egui::pos2(c.x, c.y),
+        egui::pos2(c.x - s, c.y - s / 2.0),
+    ];
+    let left = vec![
+        top[3],
+        top[2],
+        egui::pos2(c.x, c.y + s),
+        egui::pos2(c.x - s, c.y + s / 2.0),
+    ];
+    let right = vec![
+        top[1],
+        egui::pos2(c.x + s, c.y + s / 2.0),
+        egui::pos2(c.x, c.y + s),
+        top[2],
+    ];
+    p.add(egui::Shape::convex_polygon(left, dark, egui::Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(right, base, egui::Stroke::NONE));
+    p.add(egui::Shape::convex_polygon(top, light, egui::Stroke::NONE));
+}
 pub fn run() -> eframe::Result {
     eframe::run_native(
         "ハコニワ",
         eframe::NativeOptions::default(),
-        Box::new(|_| Ok(Box::new(HakoniwaApp::default()))),
+        Box::new(|cc| Ok(Box::new(HakoniwaApp::new(&cc.egui_ctx)))),
     )
 }
