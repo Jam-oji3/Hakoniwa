@@ -7,8 +7,7 @@ pub struct HakoniwaApp {
     selected: Option<u64>,
     status: String,
     zoom: f32,
-    azimuth: f32,
-    elevation: f32,
+    orientation: Quat,
     pan: egui::Vec2,
     perspective: bool,
 }
@@ -38,8 +37,8 @@ impl HakoniwaApp {
             selected: None,
             status: "ハンマーのMVPサンプルを読み込みました".into(),
             zoom: 1.0,
-            azimuth: 45.0,
-            elevation: 35.0,
+            orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
+                * Quat::from_rotation_z(45.0_f32.to_radians()),
             pan: egui::Vec2::ZERO,
             perspective: true,
         }
@@ -135,8 +134,7 @@ impl eframe::App for HakoniwaApp {
                 &mut columns[2],
                 &self.project,
                 &mut self.zoom,
-                &mut self.azimuth,
-                &mut self.elevation,
+                &mut self.orientation,
                 &mut self.pan,
                 &mut self.perspective,
             );
@@ -180,8 +178,7 @@ fn draw_preview(
     ui: &mut egui::Ui,
     project: &Project,
     zoom: &mut f32,
-    azimuth: &mut f32,
-    elevation: &mut f32,
+    orientation: &mut Quat,
     pan: &mut egui::Vec2,
     perspective: &mut bool,
 ) {
@@ -189,8 +186,8 @@ fn draw_preview(
         ui.heading("3D Assembly ビュー");
         ui.checkbox(perspective, "透視投影");
         if ui.button("ビューをリセット").clicked() {
-            *azimuth = 45.0;
-            *elevation = 35.0;
+            *orientation = Quat::from_rotation_x(-35.0_f32.to_radians())
+                * Quat::from_rotation_z(45.0_f32.to_radians());
             *zoom = 1.0;
             *pan = egui::Vec2::ZERO;
         }
@@ -204,13 +201,7 @@ fn draw_preview(
                 if input.modifiers.shift {
                     *pan += delta;
                 } else {
-                    let azimuth_direction = if elevation.to_radians().cos().is_sign_negative() {
-                        -1.0
-                    } else {
-                        1.0
-                    };
-                    *azimuth = (*azimuth + delta.x * 0.5 * azimuth_direction).rem_euclid(360.0);
-                    *elevation = (*elevation - delta.y * 0.5).rem_euclid(360.0);
+                    apply_turntable_drag(orientation, delta);
                 }
             }
             if input.smooth_scroll_delta.y != 0.0 {
@@ -224,15 +215,39 @@ fn draw_preview(
         &painter,
         rect,
         project,
-        turntable_orientation(*azimuth, *elevation),
+        *orientation,
         *zoom,
         *pan,
         *perspective,
     );
 }
 
-fn turntable_orientation(azimuth: f32, elevation: f32) -> Quat {
-    Quat::from_rotation_x(-elevation.to_radians()) * Quat::from_rotation_z(azimuth.to_radians())
+fn apply_turntable_drag(orientation: &mut Quat, delta: egui::Vec2) {
+    const RADIANS_PER_PIXEL: f32 = std::f32::consts::PI / 360.0;
+
+    let view_inverse = orientation.conjugate();
+    let view_right = view_inverse * Vec3::X;
+    let view_up = view_inverse * Vec3::Y;
+    let view_direction = view_inverse * Vec3::Z;
+
+    let mut pitch_axis = Vec3::Z.cross(view_direction);
+    if pitch_axis.length_squared() > 0.001 {
+        pitch_axis = pitch_axis.normalize();
+        if pitch_axis.dot(view_right) < 0.0 {
+            pitch_axis = -pitch_axis;
+        }
+        let mut blend =
+            (Vec3::Z.angle_between(view_direction) / std::f32::consts::PI - 0.5).abs() * 2.0;
+        blend *= blend;
+        pitch_axis = pitch_axis.lerp(view_right, blend).normalize();
+    } else {
+        pitch_axis = view_right;
+    }
+
+    let yaw_direction = if view_up.z < 0.0 { -1.0 } else { 1.0 };
+    let pitch = Quat::from_axis_angle(pitch_axis, delta.y * RADIANS_PER_PIXEL);
+    let yaw = Quat::from_rotation_z(delta.x * RADIANS_PER_PIXEL * yaw_direction);
+    *orientation = (*orientation * pitch * yaw).normalize();
 }
 
 struct Camera {
