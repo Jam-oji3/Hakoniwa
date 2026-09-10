@@ -1,7 +1,6 @@
 use eframe::egui;
 use hakoniwa_domain::{Bead, Color, GridPosition, Piece, Plane, Project};
 use std::{collections::BTreeSet, sync::Arc};
-
 pub struct HakoniwaApp {
     project: Project,
     selected: Option<u64>,
@@ -156,7 +155,17 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut 
         ui.label("ズーム");
         ui.add(egui::Slider::new(zoom, 0.5..=2.0));
     });
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::drag());
+    if response.hovered() {
+        ui.input(|input| {
+            if input.pointer.button_down(egui::PointerButton::Middle) {
+                *yaw = (*yaw + input.pointer.delta().x * 0.5).rem_euclid(360.0);
+            }
+            if input.smooth_scroll_delta.y != 0.0 {
+                *zoom = (*zoom * (1.0 + input.smooth_scroll_delta.y * 0.001)).clamp(0.5, 2.0);
+            }
+        });
+    }
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
     let occupied = project
