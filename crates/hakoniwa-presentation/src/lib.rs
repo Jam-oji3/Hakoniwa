@@ -204,7 +204,12 @@ fn draw_preview(
                 if input.modifiers.shift {
                     *pan += delta;
                 } else {
-                    *azimuth = (*azimuth + delta.x * 0.5).rem_euclid(360.0);
+                    let azimuth_direction = if elevation.to_radians().cos().is_sign_negative() {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    *azimuth = (*azimuth + delta.x * 0.5 * azimuth_direction).rem_euclid(360.0);
                     *elevation = (*elevation + delta.y * 0.5).rem_euclid(360.0);
                 }
             }
