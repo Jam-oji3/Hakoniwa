@@ -2,6 +2,8 @@
 
 use std::collections::BTreeMap;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
 pub type ObjectId = u64;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -11,6 +13,24 @@ pub struct GridPosition {
     pub z: i32,
 }
 
+impl Serialize for GridPosition {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format!("{},{},{}", self.x, self.y, self.z))
+    }
+}
+
+impl<'de> Deserialize<'de> for GridPosition {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let mut values = value.split(',').map(str::parse::<i32>);
+        let (Some(Ok(x)), Some(Ok(y)), Some(Ok(z)), None) =
+            (values.next(), values.next(), values.next(), values.next())
+        else {
+            return Err(serde::de::Error::custom("grid position must be x,y,z"));
+        };
+        Ok(Self { x, y, z })
+    }
+}
 impl GridPosition {
     #[must_use]
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
@@ -18,7 +38,7 @@ impl GridPosition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Plane {
     Xy { z: i32 },
     Xz { y: i32 },
@@ -36,7 +56,7 @@ impl Plane {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Color(pub u8, pub u8, pub u8);
 
 impl Color {
@@ -44,20 +64,20 @@ impl Color {
     pub const BROWN: Self = Self(117, 78, 47);
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Bead {
     pub position: GridPosition,
     pub color: Color,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Shape {
     pub id: ObjectId,
     pub name: String,
     pub beads: BTreeMap<GridPosition, Color>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Piece {
     pub id: ObjectId,
     pub name: String,
@@ -101,7 +121,7 @@ impl Piece {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutputReadiness {
     pub remaining_shape_ids: Vec<ObjectId>,
 }
@@ -113,7 +133,7 @@ impl OutputReadiness {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Project {
     pub name: String,
     pub shapes: BTreeMap<ObjectId, Shape>,
@@ -228,7 +248,7 @@ impl Project {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DomainError {
     ShapeNotFound(ObjectId),
     PieceIsNotPlanar {
