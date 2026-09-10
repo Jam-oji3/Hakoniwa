@@ -201,8 +201,8 @@ fn draw_preview(
                 if input.modifiers.shift {
                     *pan += delta;
                 } else {
-                    let rotation = Quat::from_rotation_y(delta.x * 0.01)
-                        * Quat::from_rotation_x(delta.y * 0.01);
+                    let rotation = Quat::from_rotation_y(-delta.x * 0.01)
+                        * Quat::from_rotation_x(-delta.y * 0.01);
                     *orientation = (rotation * *orientation).normalize();
                 }
             }
