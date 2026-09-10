@@ -1,6 +1,6 @@
 use eframe::egui;
 use hakoniwa_domain::{Bead, Color, GridPosition, Piece, Plane, Project};
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 pub struct HakoniwaApp {
     project: Project,
@@ -159,17 +159,38 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut 
     let (rect, _) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
+    let occupied = project
+        .pieces
+        .values()
+        .flat_map(|piece| piece.beads.keys().copied())
+        .collect::<BTreeSet<_>>();
     for piece in project.pieces.values() {
         for (position, color) in &piece.beads {
-            draw_voxel(painter, rect.center(), *position, *color, *yaw, *zoom);
+            draw_voxel(
+                painter,
+                rect.center(),
+                *position,
+                *color,
+                *yaw,
+                *zoom,
+                &occupied,
+            );
         }
     }
 }
 fn project(center: egui::Pos2, x: f32, y: f32, z: f32, yaw: f32, zoom: f32) -> egui::Pos2 {
-    let angle = yaw.to_radians();
-    let horizontal = (x * angle.cos() - y * angle.sin()) * 20.0 * zoom;
-    let depth = (x * angle.sin() + y * angle.cos()) * 9.0 * zoom;
-    egui::pos2(center.x + horizontal, center.y + depth - z * 20.0 * zoom)
+    let a = yaw.to_radians();
+    egui::pos2(
+        center.x + (x * a.cos() - y * a.sin()) * 20.0 * zoom,
+        center.y + (x * a.sin() + y * a.cos()) * 9.0 * zoom - z * 20.0 * zoom,
+    )
+}
+fn draw_face(p: &egui::Painter, points: Vec<egui::Pos2>, color: egui::Color32) {
+    p.add(egui::Shape::convex_polygon(
+        points,
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 fn draw_voxel(
     p: &egui::Painter,
@@ -178,29 +199,15 @@ fn draw_voxel(
     color: Color,
     yaw: f32,
     zoom: f32,
+    occupied: &BTreeSet<GridPosition>,
 ) {
     let x = pos.x as f32;
     let y = pos.y as f32;
     let z = pos.z as f32;
     let v = |dx, dy, dz| project(center, x + dx, y + dy, z + dz, yaw, zoom);
-    let top = vec![
-        v(-0.5, -0.5, 0.5),
-        v(0.5, -0.5, 0.5),
-        v(0.5, 0.5, 0.5),
-        v(-0.5, 0.5, 0.5),
-    ];
-    let near_x = vec![
-        v(0.5, -0.5, -0.5),
-        v(0.5, 0.5, -0.5),
-        v(0.5, 0.5, 0.5),
-        v(0.5, -0.5, 0.5),
-    ];
-    let near_y = vec![
-        v(-0.5, 0.5, -0.5),
-        v(0.5, 0.5, -0.5),
-        v(0.5, 0.5, 0.5),
-        v(-0.5, 0.5, 0.5),
-    ];
+    let a = yaw.to_radians();
+    let sx = if a.sin() >= 0.0 { 1 } else { -1 };
+    let sy = if a.cos() >= 0.0 { 1 } else { -1 };
     let base = egui::Color32::from_rgb(color.0, color.1, color.2);
     let dark = egui::Color32::from_rgb(color.0 / 2, color.1 / 2, color.2 / 2);
     let light = egui::Color32::from_rgb(
@@ -208,17 +215,44 @@ fn draw_voxel(
         color.1.saturating_add(35),
         color.2.saturating_add(35),
     );
-    p.add(egui::Shape::convex_polygon(
-        near_x,
-        dark,
-        egui::Stroke::NONE,
-    ));
-    p.add(egui::Shape::convex_polygon(
-        near_y,
-        base,
-        egui::Stroke::NONE,
-    ));
-    p.add(egui::Shape::convex_polygon(top, light, egui::Stroke::NONE));
+    if !occupied.contains(&GridPosition::new(pos.x, pos.y, pos.z + 1)) {
+        draw_face(
+            p,
+            vec![
+                v(-0.5, -0.5, 0.5),
+                v(0.5, -0.5, 0.5),
+                v(0.5, 0.5, 0.5),
+                v(-0.5, 0.5, 0.5),
+            ],
+            light,
+        );
+    }
+    if !occupied.contains(&GridPosition::new(pos.x + sx, pos.y, pos.z)) {
+        let q = sx as f32 * 0.5;
+        draw_face(
+            p,
+            vec![
+                v(q, -0.5, -0.5),
+                v(q, 0.5, -0.5),
+                v(q, 0.5, 0.5),
+                v(q, -0.5, 0.5),
+            ],
+            dark,
+        );
+    }
+    if !occupied.contains(&GridPosition::new(pos.x, pos.y + sy, pos.z)) {
+        let q = sy as f32 * 0.5;
+        draw_face(
+            p,
+            vec![
+                v(-0.5, q, -0.5),
+                v(0.5, q, -0.5),
+                v(0.5, q, 0.5),
+                v(-0.5, q, 0.5),
+            ],
+            base,
+        );
+    }
 }
 pub fn run() -> eframe::Result {
     eframe::run_native(
