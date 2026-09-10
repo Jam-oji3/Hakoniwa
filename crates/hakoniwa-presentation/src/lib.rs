@@ -1,13 +1,13 @@
 use eframe::egui;
+use glam::{Quat, Vec3};
 use hakoniwa_domain::{Bead, Color, GridPosition, Piece, Plane, Project};
 use std::{collections::BTreeSet, sync::Arc};
 pub struct HakoniwaApp {
     project: Project,
     selected: Option<u64>,
     status: String,
-    yaw: f32,
     zoom: f32,
-    pitch: f32,
+    orientation: Quat,
     pan: egui::Vec2,
     perspective: bool,
 }
@@ -36,9 +36,9 @@ impl HakoniwaApp {
             project: hammer_project(),
             selected: None,
             status: "ハンマーのMVPサンプルを読み込みました".into(),
-            yaw: 45.0,
             zoom: 1.0,
-            pitch: 25.0,
+            orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
+                * Quat::from_rotation_z(45.0_f32.to_radians()),
             pan: egui::Vec2::ZERO,
             perspective: true,
         }
@@ -133,9 +133,8 @@ impl eframe::App for HakoniwaApp {
             draw_preview(
                 &mut columns[2],
                 &self.project,
-                &mut self.yaw,
                 &mut self.zoom,
-                &mut self.pitch,
+                &mut self.orientation,
                 &mut self.pan,
                 &mut self.perspective,
             );
@@ -178,174 +177,248 @@ fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
 fn draw_preview(
     ui: &mut egui::Ui,
     project: &Project,
-    yaw: &mut f32,
     zoom: &mut f32,
-    pitch: &mut f32,
+    orientation: &mut Quat,
     pan: &mut egui::Vec2,
     perspective: &mut bool,
 ) {
-    ui.heading("3D Assembly ビュー");
-    ui.checkbox(perspective, "透視投影");
     ui.horizontal(|ui| {
-        ui.label("カメラ回転");
-        ui.add(egui::Slider::new(yaw, 0.0..=360.0).suffix("°"));
+        ui.heading("3D Assembly ビュー");
+        ui.checkbox(perspective, "透視投影");
+        if ui.button("ビューをリセット").clicked() {
+            *orientation = Quat::from_rotation_x(-35.0_f32.to_radians())
+                * Quat::from_rotation_z(45.0_f32.to_radians());
+            *zoom = 1.0;
+            *pan = egui::Vec2::ZERO;
+        }
     });
-    ui.horizontal(|ui| {
-        ui.label("ズーム");
-        ui.add(egui::Slider::new(zoom, 0.5..=2.0));
-    });
+    ui.label("中ホイールドラッグ: 回転 / Shift+中ホイール: 移動 / ホイール: ズーム");
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
     if response.hovered() {
         ui.input(|input| {
             if input.pointer.button_down(egui::PointerButton::Middle) {
+                let delta = input.pointer.delta();
                 if input.modifiers.shift {
-                    *pan += input.pointer.delta();
+                    *pan += delta;
                 } else {
-                    *yaw = (*yaw + input.pointer.delta().x * 0.5).rem_euclid(360.0);
-                    *pitch = (*pitch - input.pointer.delta().y * 0.5).clamp(-85.0, 85.0);
+                    let rotation = Quat::from_rotation_y(-delta.x * 0.01)
+                        * Quat::from_rotation_x(-delta.y * 0.01);
+                    *orientation = (rotation * *orientation).normalize();
                 }
             }
             if input.smooth_scroll_delta.y != 0.0 {
-                *zoom = (*zoom * (1.0 + input.smooth_scroll_delta.y * 0.001)).clamp(0.5, 2.0);
+                *zoom = (*zoom * (1.0 + input.smooth_scroll_delta.y * 0.001)).clamp(0.1, 8.0);
             }
         });
     }
-    let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(244));
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
+    render_voxels(
+        &painter,
+        rect,
+        project,
+        *orientation,
+        *zoom,
+        *pan,
+        *perspective,
+    );
+}
+
+struct Camera {
+    orientation: Quat,
+    target: Vec3,
+    pixels_per_unit: f32,
+    pan: egui::Vec2,
+    perspective: bool,
+    focal_distance: f32,
+}
+
+struct RenderFace {
+    depth: f32,
+    points: Vec<egui::Pos2>,
+    color: egui::Color32,
+}
+
+fn render_voxels(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    project: &Project,
+    orientation: Quat,
+    zoom: f32,
+    pan: egui::Vec2,
+    perspective: bool,
+) {
     let occupied = project
         .pieces
         .values()
         .flat_map(|piece| piece.beads.keys().copied())
         .collect::<BTreeSet<_>>();
+    if occupied.is_empty() {
+        return;
+    }
+    let min = Vec3::new(
+        occupied.iter().map(|p| p.x).min().unwrap() as f32,
+        occupied.iter().map(|p| p.y).min().unwrap() as f32,
+        occupied.iter().map(|p| p.z).min().unwrap() as f32,
+    );
+    let max = Vec3::new(
+        occupied.iter().map(|p| p.x).max().unwrap() as f32,
+        occupied.iter().map(|p| p.y).max().unwrap() as f32,
+        occupied.iter().map(|p| p.z).max().unwrap() as f32,
+    );
+    let span = (max - min + Vec3::ONE).max_element().max(1.0);
+    let camera = Camera {
+        orientation,
+        target: (min + max) * 0.5,
+        pixels_per_unit: rect.width().min(rect.height()) * 0.65 / span * zoom,
+        pan,
+        perspective,
+        focal_distance: span * 4.0,
+    };
+    let mut faces = Vec::new();
     for piece in project.pieces.values() {
         for (position, color) in &piece.beads {
-            draw_voxel(
-                painter,
+            append_faces(
+                &mut faces,
                 rect.center(),
                 *position,
                 *color,
-                *yaw,
-                *zoom,
-                *pitch,
-                *pan,
-                *perspective,
                 &occupied,
+                &camera,
             );
         }
     }
+    faces.sort_by(|a, b| a.depth.total_cmp(&b.depth));
+    for face in faces {
+        painter.add(egui::Shape::convex_polygon(
+            face.points,
+            face.color,
+            egui::Stroke::NONE,
+        ));
+    }
 }
-#[allow(clippy::too_many_arguments)]
-fn project(
+
+fn append_faces(
+    output: &mut Vec<RenderFace>,
     center: egui::Pos2,
-    x: f32,
-    y: f32,
-    z: f32,
-    yaw: f32,
-    pitch: f32,
-    zoom: f32,
-    pan: egui::Vec2,
-    perspective: bool,
-) -> egui::Pos2 {
-    let yaw = yaw.to_radians();
-    let pitch = pitch.to_radians();
-    let rx = x * yaw.cos() - y * yaw.sin();
-    let ry = x * yaw.sin() + y * yaw.cos();
-    let screen_y = ry * pitch.cos() - z * pitch.sin();
-    let depth = ry * pitch.sin() + z * pitch.cos();
-    let scale = if perspective {
-        (1.0 / (1.0 + depth * 0.08)).clamp(0.55, 1.8)
+    position: GridPosition,
+    color: Color,
+    occupied: &BTreeSet<GridPosition>,
+    camera: &Camera,
+) {
+    let x = position.x as f32;
+    let y = position.y as f32;
+    let z = position.z as f32;
+    let definitions = [
+        (
+            GridPosition::new(1, 0, 0),
+            Vec3::X,
+            [
+                Vec3::new(0.5, -0.5, -0.5),
+                Vec3::new(0.5, 0.5, -0.5),
+                Vec3::new(0.5, 0.5, 0.5),
+                Vec3::new(0.5, -0.5, 0.5),
+            ],
+        ),
+        (
+            GridPosition::new(-1, 0, 0),
+            Vec3::NEG_X,
+            [
+                Vec3::new(-0.5, 0.5, -0.5),
+                Vec3::new(-0.5, -0.5, -0.5),
+                Vec3::new(-0.5, -0.5, 0.5),
+                Vec3::new(-0.5, 0.5, 0.5),
+            ],
+        ),
+        (
+            GridPosition::new(0, 1, 0),
+            Vec3::Y,
+            [
+                Vec3::new(0.5, 0.5, -0.5),
+                Vec3::new(-0.5, 0.5, -0.5),
+                Vec3::new(-0.5, 0.5, 0.5),
+                Vec3::new(0.5, 0.5, 0.5),
+            ],
+        ),
+        (
+            GridPosition::new(0, -1, 0),
+            Vec3::NEG_Y,
+            [
+                Vec3::new(-0.5, -0.5, -0.5),
+                Vec3::new(0.5, -0.5, -0.5),
+                Vec3::new(0.5, -0.5, 0.5),
+                Vec3::new(-0.5, -0.5, 0.5),
+            ],
+        ),
+        (
+            GridPosition::new(0, 0, 1),
+            Vec3::Z,
+            [
+                Vec3::new(-0.5, -0.5, 0.5),
+                Vec3::new(0.5, -0.5, 0.5),
+                Vec3::new(0.5, 0.5, 0.5),
+                Vec3::new(-0.5, 0.5, 0.5),
+            ],
+        ),
+        (
+            GridPosition::new(0, 0, -1),
+            Vec3::NEG_Z,
+            [
+                Vec3::new(-0.5, 0.5, -0.5),
+                Vec3::new(0.5, 0.5, -0.5),
+                Vec3::new(0.5, -0.5, -0.5),
+                Vec3::new(-0.5, -0.5, -0.5),
+            ],
+        ),
+    ];
+    for (neighbor, normal, corners) in definitions {
+        let adjacent = GridPosition::new(
+            position.x + neighbor.x,
+            position.y + neighbor.y,
+            position.z + neighbor.z,
+        );
+        if occupied.contains(&adjacent) {
+            continue;
+        }
+        let camera_normal = camera.orientation * normal;
+        if camera_normal.z <= 0.001 {
+            continue;
+        }
+        let mut points = Vec::with_capacity(4);
+        let mut depth = 0.0;
+        for corner in corners {
+            let camera_point = camera.orientation * (Vec3::new(x, y, z) + corner - camera.target);
+            depth += camera_point.z;
+            points.push(project_point(center, camera_point, camera));
+        }
+        let light = (0.45
+            + 0.55
+                * camera_normal
+                    .dot(Vec3::new(0.3, 0.4, 0.866).normalize())
+                    .abs())
+        .clamp(0.35, 1.0);
+        output.push(RenderFace {
+            depth: depth / 4.0,
+            points,
+            color: egui::Color32::from_rgb(
+                (color.0 as f32 * light) as u8,
+                (color.1 as f32 * light) as u8,
+                (color.2 as f32 * light) as u8,
+            ),
+        });
+    }
+}
+
+fn project_point(center: egui::Pos2, point: Vec3, camera: &Camera) -> egui::Pos2 {
+    let perspective_scale = if camera.perspective {
+        (camera.focal_distance / (camera.focal_distance - point.z)).clamp(0.2, 5.0)
     } else {
         1.0
     };
     egui::pos2(
-        center.x + pan.x + rx * 20.0 * zoom * scale,
-        center.y + pan.y + screen_y * 20.0 * zoom * scale,
+        center.x + camera.pan.x + point.x * camera.pixels_per_unit * perspective_scale,
+        center.y + camera.pan.y - point.y * camera.pixels_per_unit * perspective_scale,
     )
-}
-fn draw_face(p: &egui::Painter, points: Vec<egui::Pos2>, color: egui::Color32) {
-    p.add(egui::Shape::convex_polygon(
-        points,
-        color,
-        egui::Stroke::NONE,
-    ));
-}
-#[allow(clippy::too_many_arguments)]
-fn draw_voxel(
-    p: &egui::Painter,
-    center: egui::Pos2,
-    pos: GridPosition,
-    color: Color,
-    yaw: f32,
-    zoom: f32,
-    pitch: f32,
-    pan: egui::Vec2,
-    perspective: bool,
-    occupied: &BTreeSet<GridPosition>,
-) {
-    let x = pos.x as f32;
-    let y = pos.y as f32;
-    let z = pos.z as f32;
-    let v = |dx, dy, dz| {
-        project(
-            center,
-            x + dx,
-            y + dy,
-            z + dz,
-            yaw,
-            pitch,
-            zoom,
-            pan,
-            perspective,
-        )
-    };
-    let a = yaw.to_radians();
-    let sx = if a.sin() >= 0.0 { 1 } else { -1 };
-    let sy = if a.cos() >= 0.0 { 1 } else { -1 };
-    let base = egui::Color32::from_rgb(color.0, color.1, color.2);
-    let dark = egui::Color32::from_rgb(color.0 / 2, color.1 / 2, color.2 / 2);
-    let light = egui::Color32::from_rgb(
-        color.0.saturating_add(35),
-        color.1.saturating_add(35),
-        color.2.saturating_add(35),
-    );
-    if !occupied.contains(&GridPosition::new(pos.x, pos.y, pos.z + 1)) {
-        draw_face(
-            p,
-            vec![
-                v(-0.5, -0.5, 0.5),
-                v(0.5, -0.5, 0.5),
-                v(0.5, 0.5, 0.5),
-                v(-0.5, 0.5, 0.5),
-            ],
-            light,
-        );
-    }
-    if !occupied.contains(&GridPosition::new(pos.x + sx, pos.y, pos.z)) {
-        let q = sx as f32 * 0.5;
-        draw_face(
-            p,
-            vec![
-                v(q, -0.5, -0.5),
-                v(q, 0.5, -0.5),
-                v(q, 0.5, 0.5),
-                v(q, -0.5, 0.5),
-            ],
-            dark,
-        );
-    }
-    if !occupied.contains(&GridPosition::new(pos.x, pos.y + sy, pos.z)) {
-        let q = sy as f32 * 0.5;
-        draw_face(
-            p,
-            vec![
-                v(-0.5, q, -0.5),
-                v(0.5, q, -0.5),
-                v(0.5, q, 0.5),
-                v(-0.5, q, 0.5),
-            ],
-            base,
-        );
-    }
 }
 pub fn run() -> eframe::Result {
     eframe::run_native(

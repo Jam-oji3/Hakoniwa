@@ -1327,6 +1327,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "glam"
+version = "0.33.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e762b9b188634fc508d4ec54b62ea3d352c43fd431d18d05d46f559f217f4725"
+
+[[package]]
 name = "glifo"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1480,6 +1486,7 @@ name = "hakoniwa-presentation"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "glam",
  "hakoniwa-application",
  "hakoniwa-domain",
 ]

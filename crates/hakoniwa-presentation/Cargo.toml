@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 eframe = "0.36.2"
+glam = "0.33.7"
 hakoniwa-application = { version = "0.1.0", path = "../hakoniwa-application" }
 hakoniwa-domain = { version = "0.1.0", path = "../hakoniwa-domain" }
