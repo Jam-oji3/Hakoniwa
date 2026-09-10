@@ -1488,6 +1488,7 @@ dependencies = [
 name = "hakoniwa-infrastructure"
 version = "0.1.0"
 dependencies = [
+ "hakoniwa-application",
  "hakoniwa-domain",
  "serde",
  "serde_json",

@@ -1,11 +1,18 @@
 //! Application commands and undo/redo history.
 
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, path::Path};
 
 use hakoniwa_domain::{
     Bead, Color, DomainError, GridPosition, ObjectId, ObjectRef, OrthogonalOrientation, Placement,
     Plane, Project, VoxelObjectRef,
 };
+
+pub trait ProjectRepository {
+    type Error;
+
+    fn save(&self, path: &Path, project: &Project) -> Result<(), Self::Error>;
+    fn load(&self, path: &Path) -> Result<Project, Self::Error>;
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
