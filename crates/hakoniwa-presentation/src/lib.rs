@@ -232,6 +232,7 @@ fn draw_preview(
         }
     }
 }
+#[allow(clippy::too_many_arguments)]
 fn project(
     center: egui::Pos2,
     x: f32,
@@ -266,6 +267,7 @@ fn draw_face(p: &egui::Painter, points: Vec<egui::Pos2>, color: egui::Color32) {
         egui::Stroke::NONE,
     ));
 }
+#[allow(clippy::too_many_arguments)]
 fn draw_voxel(
     p: &egui::Painter,
     center: egui::Pos2,
