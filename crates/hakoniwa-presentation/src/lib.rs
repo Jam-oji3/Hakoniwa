@@ -150,8 +150,12 @@ impl eframe::App for HakoniwaApp {
             orientation,
             pan,
             perspective,
+            close_requested: None,
         };
         workspace.ui(&mut behavior, ui);
+        if let Some(tile_id) = behavior.close_requested {
+            workspace.tiles.set_visible(tile_id, false);
+        }
     }
 }
 
@@ -179,6 +183,7 @@ struct WorkspaceBehavior<'a> {
     orientation: &'a mut Quat,
     pan: &'a mut egui::Vec2,
     perspective: &'a mut bool,
+    close_requested: Option<egui_tiles::TileId>,
 }
 
 impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
@@ -229,10 +234,10 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
 
     fn on_tab_close(
         &mut self,
-        tiles: &mut egui_tiles::Tiles<WorkspacePane>,
+        _tiles: &mut egui_tiles::Tiles<WorkspacePane>,
         tile_id: egui_tiles::TileId,
     ) -> bool {
-        tiles.set_visible(tile_id, false);
+        self.close_requested = Some(tile_id);
         false
     }
 
