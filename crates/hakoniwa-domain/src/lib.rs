@@ -38,7 +38,7 @@ impl GridPosition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum Plane {
     Xy { z: i32 },
     Xz { y: i32 },
@@ -56,7 +56,7 @@ impl Plane {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Color(pub u8, pub u8, pub u8);
 
 impl Color {
@@ -64,7 +64,7 @@ impl Color {
     pub const BROWN: Self = Self(117, 78, 47);
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Bead {
     pub position: GridPosition,
     pub color: Color,
@@ -248,7 +248,7 @@ impl Project {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum DomainError {
     ShapeNotFound(ObjectId),
     PieceIsNotPlanar {
@@ -261,6 +261,79 @@ pub enum DomainError {
     },
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BeadInventory {
+    pub by_color: BTreeMap<Color, usize>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StructuralWarning {
+    ShallowJoint {
+        piece_a: ObjectId,
+        piece_b: ObjectId,
+    },
+    UnsupportedPiece {
+        piece_id: ObjectId,
+    },
+}
+
+impl Project {
+    #[must_use]
+    pub fn inventory(&self) -> BeadInventory {
+        let mut by_color = BTreeMap::new();
+        for piece in self.pieces.values() {
+            for color in piece.beads.values() {
+                *by_color.entry(*color).or_insert(0) += 1;
+            }
+        }
+        BeadInventory {
+            total: by_color.values().sum(),
+            by_color,
+        }
+    }
+
+    #[must_use]
+    pub fn structural_warnings(&self) -> Vec<StructuralWarning> {
+        let pieces = self.pieces.values().collect::<Vec<_>>();
+        let mut warnings = Vec::new();
+        for (index, a) in pieces.iter().enumerate() {
+            for b in pieces.iter().skip(index + 1) {
+                let contacts = a
+                    .beads
+                    .keys()
+                    .filter(|pa| {
+                        b.beads.keys().any(|pb| {
+                            (pa.x - pb.x).abs() + (pa.y - pb.y).abs() + (pa.z - pb.z).abs() == 1
+                        })
+                    })
+                    .count();
+                if contacts == 1 {
+                    warnings.push(StructuralWarning::ShallowJoint {
+                        piece_a: a.id,
+                        piece_b: b.id,
+                    });
+                }
+            }
+        }
+        for piece in &pieces {
+            if piece.beads.values().any(|_| true)
+                && !pieces.iter().any(|other| {
+                    other.id != piece.id
+                        && piece.beads.keys().any(|p| {
+                            other
+                                .beads
+                                .keys()
+                                .any(|q| p.z > q.z && (p.x - q.x).abs() + (p.y - q.y).abs() <= 1)
+                        })
+                })
+            {
+                warnings.push(StructuralWarning::UnsupportedPiece { piece_id: piece.id });
+            }
+        }
+        warnings
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
