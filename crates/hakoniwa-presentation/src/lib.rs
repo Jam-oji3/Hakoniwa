@@ -82,6 +82,8 @@ fn hammer_project() -> Project {
 }
 impl eframe::App for HakoniwaApp {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, egui::Color32::WHITE);
         ui.horizontal(|ui| {
             if ui.button("ハンマーを新規作成").clicked() {
                 self.project = hammer_project();
