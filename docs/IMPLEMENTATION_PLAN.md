@@ -44,6 +44,22 @@
 | M9 | 接合推定・構造チェック | 接合候補とリスク警告 | ハンマーの浅い柄を警告できる |
 | M10 | 統合・配布 | 受入試験、Windows x64 `.exe` | 初期受入条件を満たす |
 
+### 2.1 現在の実装状況（2026-09-10）
+
+| ID | 状況 | 現在地 |
+| --- | --- | --- |
+| M0 | 完了 | ワークスペース、品質検査、Windows起動を確認済み |
+| M1 | 一部完了 | Project/Shape/Piece/Beadと平面不変条件を実装。Assembly階層・姿勢は未実装 |
+| M2 | 一部完了 | AddBeadとPiece化Command、Undo/Redo基盤を実装。編集Command一式は未実装 |
+| M3 | 一部完了 | `.ibcad`の基本保存・読込を実装。異常系、互換性、決定性の検証は未完了 |
+| M4 | 一部完了 | ドッキング可能なツリーと読取専用2D表示を実装。2D編集は未実装 |
+| M5 | 一部完了 | 3D表示、透視/平行投影、Blender風カメラ、可変ペインを実装。Assembly編集と選択同期は未実装 |
+| M6 | 一部完了 | Domain/Applicationの平面Piece化を実装。Shape編集UIは未実装 |
+| M7 | 一部完了 | Piece単位の色別集計を実装。パレットUIと階層集計は未実装 |
+| M8 | 未着手 | PDF出力は未実装 |
+| M9 | 一部完了 | 基本的な構造警告を実装。接合候補、UI連携、閾値検証は未完了 |
+| M10 | 未着手 | 統合受入試験と配布物作成は未実施 |
+
 ## 3. 詳細実装計画
 
 ### M0: 基盤・品質設定
@@ -62,11 +78,11 @@
 
 #### 確認項目
 
-- [ ] `cargo fmt --check` が成功する。
-- [ ] `cargo clippy --workspace -- -D warnings` が成功する。
-- [ ] `cargo test --workspace` が成功する。
-- [ ] `hakoniwa-domain` がegui、wgpu、PDF、ZIP、OS APIに依存していない。
-- [ ] 空のアプリがWindows 11で起動・終了できる。
+- [x] `cargo fmt --check` が成功する。
+- [x] `cargo clippy --workspace -- -D warnings` が成功する。
+- [x] `cargo test --workspace` が成功する。
+- [x] `hakoniwa-domain` がegui、wgpu、PDF、ZIP、OS APIに依存していない。
+- [x] 空のアプリがWindows 11で起動・終了できる。
 
 #### 完了条件
 
@@ -92,9 +108,9 @@
 
 #### 確認項目
 
-- [ ] 空のProjectを作成できる。
-- [ ] 正しい平面Pieceを作成できる。
-- [ ] 平面外のBeadを含むPiece生成・更新が明示的なエラーになる。
+- [x] 空のProjectを作成できる。
+- [x] 正しい平面Pieceを作成できる。
+- [x] 平面外のBeadを含むPiece生成・更新が明示的なエラーになる。
 - [ ] Shapeを含むAssemblyが「出力不可」と判定され、対象Shapeを特定できる。
 - [ ] PieceのみのAssemblyが「出力可能」と判定される。
 - [ ] 座標・姿勢・色・IDの比較とシリアライズ用表現が決定的である。
@@ -120,8 +136,8 @@ UIなしで、Piece-firstとShape-firstの中間状態を正しく表現・検�
 
 #### 確認項目
 
-- [ ] Beadを追加してUndoすると完全に元へ戻る。
-- [ ] RedoでUndo前と同じ状態に戻る。
+- [x] Beadを追加してUndoすると完全に元へ戻る。
+- [x] RedoでUndo前と同じ状態に戻る。
 - [ ] 色変更、削除、移動、Piece化後も同様に往復できる。
 - [ ] 失敗するCommandは履歴も状態も変更しない。
 - [ ] Undo後に別Commandを実行するとRedo履歴が破棄される。
@@ -154,7 +170,7 @@ UIなしで、Piece-firstとShape-firstの中間状態を正しく表現・検�
 - [ ] 空Project、複数Piece、Shapeを含むProjectを保存・読込できる。
 - [ ] 保存→読込後に、Domain状態・階層・色・配置・出力設定が等価である。
 - [ ] 壊れたZIP、欠損した`project.json`、未知の形式バージョンを安全に拒否できる。
-- [ ] 選択ハイライトや一時キャッシュが保存ファイルに含まれない。
+- [x] 選択ハイライトや一時キャッシュが保存ファイルに含まれない。
 - [ ] 同一Projectの保存結果が不要な差分を生まない。
 
 #### 完了条件
@@ -179,7 +195,7 @@ UIなしで、Piece-firstとShape-firstの中間状態を正しく表現・検�
 
 - [ ] 新しいPieceを作り、2DグリッドへBeadを置ける。
 - [ ] 色を選択・変更・削除できる。
-- [ ] ツリー上のPieceを選ぶと正しい2D図案が開く。
+- [x] ツリー上のPieceを選ぶと正しい2D図案が開く。
 - [ ] 編集後にUndo/RedoがUIから機能する。
 - [ ] 2D編集によりPieceの単一平面制約を破れない。
 - [ ] 29×29を超えるグリッドを閲覧・編集できる。
@@ -235,7 +251,7 @@ Piece-firstで作成した複数Pieceを3D Assemblyとして組み立て、保�
 - [ ] 平面選択をPiece化すると、Shapeから対象Beadが移り、新Pieceが生成される。
 - [ ] Piece化をUndo/Redoできる。
 - [ ] Shapeが残るとPDF出力前検証が失敗する。
-- [ ] ShapeをすべてPiece化すると出力可能になる。
+- [x] ShapeをすべてPiece化すると出力可能になる。
 
 #### 完了条件
 
@@ -373,7 +389,7 @@ DESIGN.mdの「初期リリースの受入条件」をすべて満たし、代�
 - [ ] PDF変更時は実ファイルを目視確認する。
 - [ ] パフォーマンスに影響する変更時は、代表作品と29×29超Pieceで操作感を確認する。
 - [ ] ユーザーに見える警告は、対象箇所・理由・改善方向を必ず含む。
-- [ ] `cargo fmt --check`、`cargo clippy --workspace -- -D warnings`、`cargo test --workspace` を通す。
+- [x] `cargo fmt --check`、`cargo clippy --workspace -- -D warnings`、`cargo test --workspace` を通す。
 
 ## 6. 初期版から除外するもの
 
