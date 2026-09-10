@@ -28,6 +28,7 @@ impl HakoniwaApp {
             .unwrap()
             .insert(0, "noto-jp".into());
         ctx.set_fonts(fonts);
+        ctx.set_visuals(egui::Visuals::light());
         Self {
             project: hammer_project(),
             selected: None,
@@ -85,7 +86,7 @@ impl eframe::App for HakoniwaApp {
         });
         ui.separator();
         let panel_rect = ui.available_rect_before_wrap();
-        let boundary_color = egui::Color32::from_gray(82);
+        let boundary_color = egui::Color32::from_gray(180);
         let first_boundary = panel_rect.left() + panel_rect.width() / 3.0;
         let second_boundary = panel_rect.left() + panel_rect.width() * 2.0 / 3.0;
         ui.painter().line_segment(
@@ -139,17 +140,17 @@ fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
     ui.label(format!("{} · {:?}", piece.name, piece.plane));
     let (rect, _) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::hover());
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(25));
+    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(250));
     for i in 0..11 {
         let x = rect.left() + i as f32 * 30.0;
         let y = rect.top() + i as f32 * 30.0;
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+            egui::Stroke::new(1.0, egui::Color32::from_gray(190)),
         );
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(1.0, egui::Color32::DARK_GRAY),
+            egui::Stroke::new(1.0, egui::Color32::from_gray(190)),
         );
     }
     for (pos, color) in &piece.beads {
@@ -185,7 +186,7 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut 
         });
     }
     let painter = ui.painter();
-    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
+    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(244));
     let occupied = project
         .pieces
         .values()
