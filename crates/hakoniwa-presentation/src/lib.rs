@@ -210,7 +210,7 @@ fn draw_preview(
                         1.0
                     };
                     *azimuth = (*azimuth + delta.x * 0.5 * azimuth_direction).rem_euclid(360.0);
-                    *elevation = (*elevation + delta.y * 0.5).rem_euclid(360.0);
+                    *elevation = (*elevation - delta.y * 0.5).rem_euclid(360.0);
                 }
             }
             if input.smooth_scroll_delta.y != 0.0 {
