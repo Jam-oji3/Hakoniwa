@@ -149,7 +149,7 @@ fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
 fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut f32) {
     ui.heading("3D Assembly ビュー");
     ui.horizontal(|ui| {
-        ui.label("回転");
+        ui.label("カメラ回転");
         ui.add(egui::Slider::new(yaw, 0.0..=360.0).suffix("°"));
     });
     ui.horizontal(|ui| {
@@ -159,47 +159,65 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, yaw: &mut f32, zoom: &mut 
     let (rect, _) = ui.allocate_exact_size(egui::vec2(330.0, 330.0), egui::Sense::hover());
     let painter = ui.painter();
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
-    let rad = yaw.to_radians();
     for piece in project.pieces.values() {
-        for (p, c) in &piece.beads {
-            let rx = p.x as f32 * rad.cos() - p.y as f32 * rad.sin();
-            let ry = p.x as f32 * rad.sin() + p.y as f32 * rad.cos();
-            let center = egui::pos2(
-                rect.center().x + rx * 20.0 * *zoom,
-                rect.center().y + ry * 10.0 * *zoom - p.z as f32 * 18.0 * *zoom,
-            );
-            draw_cube(painter, center, 9.0 * *zoom, *c);
+        for (position, color) in &piece.beads {
+            draw_voxel(painter, rect.center(), *position, *color, *yaw, *zoom);
         }
     }
 }
-fn draw_cube(p: &egui::Painter, c: egui::Pos2, s: f32, col: Color) {
-    let base = egui::Color32::from_rgb(col.0, col.1, col.2);
-    let dark = egui::Color32::from_rgb(col.0 / 2, col.1 / 2, col.2 / 2);
-    let light = egui::Color32::from_rgb(
-        col.0.saturating_add(35),
-        col.1.saturating_add(35),
-        col.2.saturating_add(35),
-    );
+fn project(center: egui::Pos2, x: f32, y: f32, z: f32, yaw: f32, zoom: f32) -> egui::Pos2 {
+    let angle = yaw.to_radians();
+    let horizontal = (x * angle.cos() - y * angle.sin()) * 20.0 * zoom;
+    let depth = (x * angle.sin() + y * angle.cos()) * 9.0 * zoom;
+    egui::pos2(center.x + horizontal, center.y + depth - z * 20.0 * zoom)
+}
+fn draw_voxel(
+    p: &egui::Painter,
+    center: egui::Pos2,
+    pos: GridPosition,
+    color: Color,
+    yaw: f32,
+    zoom: f32,
+) {
+    let x = pos.x as f32;
+    let y = pos.y as f32;
+    let z = pos.z as f32;
+    let v = |dx, dy, dz| project(center, x + dx, y + dy, z + dz, yaw, zoom);
     let top = vec![
-        egui::pos2(c.x, c.y - s),
-        egui::pos2(c.x + s, c.y - s / 2.0),
-        egui::pos2(c.x, c.y),
-        egui::pos2(c.x - s, c.y - s / 2.0),
+        v(-0.5, -0.5, 0.5),
+        v(0.5, -0.5, 0.5),
+        v(0.5, 0.5, 0.5),
+        v(-0.5, 0.5, 0.5),
     ];
-    let left = vec![
-        top[3],
-        top[2],
-        egui::pos2(c.x, c.y + s),
-        egui::pos2(c.x - s, c.y + s / 2.0),
+    let near_x = vec![
+        v(0.5, -0.5, -0.5),
+        v(0.5, 0.5, -0.5),
+        v(0.5, 0.5, 0.5),
+        v(0.5, -0.5, 0.5),
     ];
-    let right = vec![
-        top[1],
-        egui::pos2(c.x + s, c.y + s / 2.0),
-        egui::pos2(c.x, c.y + s),
-        top[2],
+    let near_y = vec![
+        v(-0.5, 0.5, -0.5),
+        v(0.5, 0.5, -0.5),
+        v(0.5, 0.5, 0.5),
+        v(-0.5, 0.5, 0.5),
     ];
-    p.add(egui::Shape::convex_polygon(left, dark, egui::Stroke::NONE));
-    p.add(egui::Shape::convex_polygon(right, base, egui::Stroke::NONE));
+    let base = egui::Color32::from_rgb(color.0, color.1, color.2);
+    let dark = egui::Color32::from_rgb(color.0 / 2, color.1 / 2, color.2 / 2);
+    let light = egui::Color32::from_rgb(
+        color.0.saturating_add(35),
+        color.1.saturating_add(35),
+        color.2.saturating_add(35),
+    );
+    p.add(egui::Shape::convex_polygon(
+        near_x,
+        dark,
+        egui::Stroke::NONE,
+    ));
+    p.add(egui::Shape::convex_polygon(
+        near_y,
+        base,
+        egui::Stroke::NONE,
+    ));
     p.add(egui::Shape::convex_polygon(top, light, egui::Stroke::NONE));
 }
 pub fn run() -> eframe::Result {
