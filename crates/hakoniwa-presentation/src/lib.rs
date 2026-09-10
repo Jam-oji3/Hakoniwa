@@ -2,6 +2,20 @@ use eframe::egui;
 use glam::{Quat, Vec3};
 use hakoniwa_domain::{Bead, Color, GridPosition, Piece, Plane, Project};
 use std::{collections::BTreeSet, sync::Arc};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkspacePane {
+    PartsTree,
+    PieceEditor,
+    AssemblyView,
+}
+
+#[derive(Clone, Copy)]
+struct WorkspacePaneIds {
+    parts_tree: egui_tiles::TileId,
+    piece_editor: egui_tiles::TileId,
+    assembly_view: egui_tiles::TileId,
+}
 pub struct HakoniwaApp {
     project: Project,
     selected: Option<u64>,
@@ -10,6 +24,8 @@ pub struct HakoniwaApp {
     orientation: Quat,
     pan: egui::Vec2,
     perspective: bool,
+    workspace: egui_tiles::Tree<WorkspacePane>,
+    pane_ids: WorkspacePaneIds,
 }
 impl HakoniwaApp {
     fn new(ctx: &egui::Context) -> Self {
@@ -32,6 +48,7 @@ impl HakoniwaApp {
             .insert(0, "noto-jp".into());
         ctx.set_fonts(fonts);
         ctx.set_visuals(egui::Visuals::light());
+        let (workspace, pane_ids) = create_workspace_tree();
         Self {
             project: hammer_project(),
             selected: None,
@@ -41,6 +58,8 @@ impl HakoniwaApp {
                 * Quat::from_rotation_z(45.0_f32.to_radians()),
             pan: egui::Vec2::ZERO,
             perspective: true,
+            workspace,
+            pane_ids,
         }
     }
 }
@@ -91,58 +110,188 @@ impl eframe::App for HakoniwaApp {
                 self.status = "ハンマーを作成しました".into();
             }
             ui.label(&self.status);
+            ui.separator();
+            ui.menu_button("表示", |ui| {
+                for (title, tile_id) in [
+                    ("パーツツリー", self.pane_ids.parts_tree),
+                    ("2Dエディタ", self.pane_ids.piece_editor),
+                    ("3D View", self.pane_ids.assembly_view),
+                ] {
+                    let visible = self.workspace.tiles.is_visible(tile_id);
+                    if ui.add_enabled(!visible, egui::Button::new(title)).clicked() {
+                        self.workspace.tiles.set_visible(tile_id, true);
+                        self.workspace.make_active(|id, _| id == tile_id);
+                        ui.close();
+                    }
+                }
+            });
+            if ui.button("レイアウトをリセット").clicked() {
+                let (workspace, pane_ids) = create_workspace_tree();
+                self.workspace = workspace;
+                self.pane_ids = pane_ids;
+            }
         });
         ui.separator();
-        let panel_rect = ui.available_rect_before_wrap();
-        let boundary_color = egui::Color32::from_gray(180);
-        let first_boundary = panel_rect.left() + panel_rect.width() / 3.0;
-        let second_boundary = panel_rect.left() + panel_rect.width() * 2.0 / 3.0;
-        ui.painter().line_segment(
-            [
-                egui::pos2(first_boundary, panel_rect.top()),
-                egui::pos2(first_boundary, panel_rect.bottom()),
-            ],
-            egui::Stroke::new(1.0, boundary_color),
-        );
-        ui.painter().line_segment(
-            [
-                egui::pos2(second_boundary, panel_rect.top()),
-                egui::pos2(second_boundary, panel_rect.bottom()),
-            ],
-            egui::Stroke::new(1.0, boundary_color),
-        );
-        ui.columns(3, |columns| {
-            columns[0].heading("パーツツリー");
-            for (id, piece) in &self.project.pieces {
-                if columns[0]
-                    .selectable_label(
-                        self.selected == Some(*id),
-                        format!("▦ {} ({} beads)", piece.name, piece.beads.len()),
-                    )
-                    .clicked()
-                {
-                    self.selected = Some(*id);
-                }
-            }
-            columns[0].separator();
-            columns[0].label(format!("総ビーズ数: {}", self.project.inventory().total));
-            draw_editor(
-                &mut columns[1],
-                self.project.pieces.get(&self.selected.unwrap_or(0)),
-            );
-            draw_preview(
-                &mut columns[2],
-                &self.project,
-                &mut self.zoom,
-                &mut self.orientation,
-                &mut self.pan,
-                &mut self.perspective,
-            );
-        });
+
+        let Self {
+            project,
+            selected,
+            zoom,
+            orientation,
+            pan,
+            perspective,
+            workspace,
+            ..
+        } = self;
+        let mut behavior = WorkspaceBehavior {
+            project,
+            selected,
+            zoom,
+            orientation,
+            pan,
+            perspective,
+        };
+        workspace.ui(&mut behavior, ui);
     }
 }
+
+fn create_workspace_tree() -> (egui_tiles::Tree<WorkspacePane>, WorkspacePaneIds) {
+    let mut tiles = egui_tiles::Tiles::default();
+    let pane_ids = WorkspacePaneIds {
+        parts_tree: tiles.insert_pane(WorkspacePane::PartsTree),
+        piece_editor: tiles.insert_pane(WorkspacePane::PieceEditor),
+        assembly_view: tiles.insert_pane(WorkspacePane::AssemblyView),
+    };
+    let parts_tabs = tiles.insert_tab_tile(vec![pane_ids.parts_tree]);
+    let editor_tabs = tiles.insert_tab_tile(vec![pane_ids.piece_editor]);
+    let assembly_tabs = tiles.insert_tab_tile(vec![pane_ids.assembly_view]);
+    let root = tiles.insert_horizontal_tile(vec![parts_tabs, editor_tabs, assembly_tabs]);
+    (
+        egui_tiles::Tree::new("hakoniwa-workspace", root, tiles),
+        pane_ids,
+    )
+}
+
+struct WorkspaceBehavior<'a> {
+    project: &'a Project,
+    selected: &'a mut Option<u64>,
+    zoom: &'a mut f32,
+    orientation: &'a mut Quat,
+    pan: &'a mut egui::Vec2,
+    perspective: &'a mut bool,
+}
+
+impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
+    fn pane_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        _tile_id: egui_tiles::TileId,
+        pane: &mut WorkspacePane,
+    ) -> egui_tiles::UiResponse {
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, egui::Color32::WHITE);
+        match pane {
+            WorkspacePane::PartsTree => draw_parts_tree(ui, self.project, self.selected),
+            WorkspacePane::PieceEditor => draw_editor(
+                ui,
+                self.project
+                    .pieces
+                    .get(&(*self.selected).unwrap_or_default()),
+            ),
+            WorkspacePane::AssemblyView => draw_preview(
+                ui,
+                self.project,
+                self.zoom,
+                self.orientation,
+                self.pan,
+                self.perspective,
+            ),
+        }
+        egui_tiles::UiResponse::None
+    }
+
+    fn tab_title_for_pane(&mut self, pane: &WorkspacePane) -> egui::WidgetText {
+        match pane {
+            WorkspacePane::PartsTree => "パーツツリー",
+            WorkspacePane::PieceEditor => "2Dエディタ",
+            WorkspacePane::AssemblyView => "3D View",
+        }
+        .into()
+    }
+
+    fn is_tab_closable(
+        &self,
+        _tiles: &egui_tiles::Tiles<WorkspacePane>,
+        _tile_id: egui_tiles::TileId,
+    ) -> bool {
+        true
+    }
+
+    fn on_tab_close(
+        &mut self,
+        tiles: &mut egui_tiles::Tiles<WorkspacePane>,
+        tile_id: egui_tiles::TileId,
+    ) -> bool {
+        tiles.set_visible(tile_id, false);
+        false
+    }
+
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        egui_tiles::SimplificationOptions {
+            all_panes_must_have_tabs: true,
+            ..Default::default()
+        }
+    }
+
+    fn min_size(&self) -> f32 {
+        120.0
+    }
+
+    fn gap_width(&self, _style: &egui::Style) -> f32 {
+        1.0
+    }
+
+    fn resize_stroke(
+        &self,
+        _style: &egui::Style,
+        resize_state: egui_tiles::ResizeState,
+    ) -> egui::Stroke {
+        match resize_state {
+            egui_tiles::ResizeState::Idle => egui::Stroke::new(1.0, egui::Color32::from_gray(175)),
+            egui_tiles::ResizeState::Hovering => {
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(90, 140, 210))
+            }
+            egui_tiles::ResizeState::Dragging => {
+                egui::Stroke::new(2.0, egui::Color32::from_rgb(55, 110, 190))
+            }
+        }
+    }
+
+    fn tab_bar_color(&self, _visuals: &egui::Visuals) -> egui::Color32 {
+        egui::Color32::from_gray(242)
+    }
+
+    fn tab_bar_hline_stroke(&self, _visuals: &egui::Visuals) -> egui::Stroke {
+        egui::Stroke::new(1.0, egui::Color32::from_gray(175))
+    }
+}
+
+fn draw_parts_tree(ui: &mut egui::Ui, project: &Project, selected: &mut Option<u64>) {
+    for (id, piece) in &project.pieces {
+        if ui
+            .selectable_label(
+                *selected == Some(*id),
+                format!("▦ {} ({} beads)", piece.name, piece.beads.len()),
+            )
+            .clicked()
+        {
+            *selected = Some(*id);
+        }
+    }
+    ui.separator();
+    ui.label(format!("総ビーズ数: {}", project.inventory().total));
+}
 fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
-    ui.heading("2D Piece エディタ");
     let Some(piece) = piece else {
         ui.label("ツリーからPieceを選択してください");
         return;
@@ -183,7 +332,6 @@ fn draw_preview(
     perspective: &mut bool,
 ) {
     ui.horizontal(|ui| {
-        ui.heading("3D Assembly ビュー");
         ui.checkbox(perspective, "透視投影");
         if ui.button("ビューをリセット").clicked() {
             *orientation = Quat::from_rotation_x(-35.0_f32.to_radians())

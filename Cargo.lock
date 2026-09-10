@@ -1007,6 +1007,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui_tiles"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "87147a0a2f03415a3082a92dba79062912d70d555f2495a54d16a7be2c81ac55"
+dependencies = [
+ "ahash",
+ "egui",
+ "itertools",
+ "log",
+]
+
+[[package]]
 name = "either"
 version = "1.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1486,6 +1498,7 @@ name = "hakoniwa-presentation"
 version = "0.1.0"
 dependencies = [
  "eframe",
+ "egui_tiles",
  "glam",
  "hakoniwa-application",
  "hakoniwa-domain",
