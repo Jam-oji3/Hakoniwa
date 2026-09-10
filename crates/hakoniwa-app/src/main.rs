@@ -1,3 +1,3 @@
-fn main() {
-    println!("Hello, world!");
+fn main() -> eframe::Result {
+    hakoniwa_presentation::run()
 }
