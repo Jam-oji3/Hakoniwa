@@ -7,7 +7,8 @@ pub struct HakoniwaApp {
     selected: Option<u64>,
     status: String,
     zoom: f32,
-    orientation: Quat,
+    azimuth: f32,
+    elevation: f32,
     pan: egui::Vec2,
     perspective: bool,
 }
@@ -37,8 +38,8 @@ impl HakoniwaApp {
             selected: None,
             status: "ハンマーのMVPサンプルを読み込みました".into(),
             zoom: 1.0,
-            orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
-                * Quat::from_rotation_z(45.0_f32.to_radians()),
+            azimuth: 45.0,
+            elevation: 35.0,
             pan: egui::Vec2::ZERO,
             perspective: true,
         }
@@ -134,7 +135,8 @@ impl eframe::App for HakoniwaApp {
                 &mut columns[2],
                 &self.project,
                 &mut self.zoom,
-                &mut self.orientation,
+                &mut self.azimuth,
+                &mut self.elevation,
                 &mut self.pan,
                 &mut self.perspective,
             );
@@ -178,7 +180,8 @@ fn draw_preview(
     ui: &mut egui::Ui,
     project: &Project,
     zoom: &mut f32,
-    orientation: &mut Quat,
+    azimuth: &mut f32,
+    elevation: &mut f32,
     pan: &mut egui::Vec2,
     perspective: &mut bool,
 ) {
@@ -186,13 +189,13 @@ fn draw_preview(
         ui.heading("3D Assembly ビュー");
         ui.checkbox(perspective, "透視投影");
         if ui.button("ビューをリセット").clicked() {
-            *orientation = Quat::from_rotation_x(-35.0_f32.to_radians())
-                * Quat::from_rotation_z(45.0_f32.to_radians());
+            *azimuth = 45.0;
+            *elevation = 35.0;
             *zoom = 1.0;
             *pan = egui::Vec2::ZERO;
         }
     });
-    ui.label("中ホイールドラッグ: 回転 / Shift+中ホイール: 移動 / ホイール: ズーム");
+    ui.label("中ホイールドラッグ: Turntable回転 / Shift+中ホイール: 移動 / ホイール: ズーム");
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
     if response.hovered() {
         ui.input(|input| {
@@ -201,9 +204,8 @@ fn draw_preview(
                 if input.modifiers.shift {
                     *pan += delta;
                 } else {
-                    let rotation = Quat::from_rotation_y(delta.x * 0.01)
-                        * Quat::from_rotation_x(delta.y * 0.01);
-                    *orientation = (rotation * *orientation).normalize();
+                    *azimuth = (*azimuth + delta.x * 0.5).rem_euclid(360.0);
+                    *elevation = (*elevation + delta.y * 0.5).clamp(-85.0, 85.0);
                 }
             }
             if input.smooth_scroll_delta.y != 0.0 {
@@ -217,11 +219,15 @@ fn draw_preview(
         &painter,
         rect,
         project,
-        *orientation,
+        turntable_orientation(*azimuth, *elevation),
         *zoom,
         *pan,
         *perspective,
     );
+}
+
+fn turntable_orientation(azimuth: f32, elevation: f32) -> Quat {
+    Quat::from_rotation_x(-elevation.to_radians()) * Quat::from_rotation_z(azimuth.to_radians())
 }
 
 struct Camera {
