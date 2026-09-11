@@ -142,7 +142,7 @@ where
                 self.editor = Editor::new(hammer_project());
                 self.selected = None;
                 self.piece_editor.reset();
-                self.assembly_editor.reset_camera();
+                self.assembly_editor.reset_project_view();
                 self.status = "ハンマーを作成しました".into();
             }
             let undo_requested = ui
@@ -191,7 +191,7 @@ where
                         self.editor = Editor::new(project);
                         self.selected = None;
                         self.piece_editor.reset();
-                        self.assembly_editor.reset_camera();
+                        self.assembly_editor.reset_project_view();
                         self.file_path = path.to_string_lossy().into_owned();
                         self.status = format!("読み込みました: {}", path.display());
                     }
@@ -537,6 +537,13 @@ struct RotateSession {
     current_angle: f32,
     quarter_turns: i8,
     camera: Camera,
+    source: RotateSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RotateSource {
+    Keyboard,
+    Gizmo,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -555,6 +562,8 @@ struct AssemblyEditorState {
     last_camera: Option<Camera>,
     camera_frame: Option<CameraFrame>,
     hovered_object: Option<ObjectRef>,
+    last_viewport_center: Option<egui::Pos2>,
+    isolated: Option<ObjectRef>,
 }
 
 impl AssemblyEditorState {
@@ -569,6 +578,12 @@ impl AssemblyEditorState {
         self.last_camera = None;
         self.camera_frame = None;
         self.hovered_object = None;
+        self.last_viewport_center = None;
+    }
+
+    fn reset_project_view(&mut self) {
+        self.reset_camera();
+        self.isolated = None;
     }
 }
 
@@ -1633,13 +1648,7 @@ struct PreviewContext<'a> {
 }
 
 fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_>) {
-    handle_assembly_shortcuts(
-        ui,
-        project,
-        *context.selected,
-        context.editor,
-        context.commands,
-    );
+    handle_assembly_shortcuts(ui, project, *context.selected, context.editor);
     ui.horizontal(|ui| {
         ui.selectable_value(&mut context.editor.tool, TransformTool::Move, "移動ギズモ");
         ui.selectable_value(
@@ -1655,6 +1664,12 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             *context.zoom = 1.0;
             *context.pan = egui::Vec2::ZERO;
             context.editor.reset_camera();
+        }
+        if context.editor.isolated.is_some() {
+            ui.colored_label(egui::Color32::from_rgb(210, 105, 15), "分離表示中");
+            if ui.button("分離表示を解除").clicked() {
+                context.editor.isolated = None;
+            }
         }
     });
     if let Some(session) = context.editor.move_session {
@@ -1684,8 +1699,44 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
     ui.label(
         "中ホイールドラッグ: マウス下を中心にTurntable回転 / Shift+中ホイール: 移動 / ホイール: ズーム",
     );
+    ui.label("F: 選択へフォーカス / Home: 表示全体へフィット / /: 選択を分離表示");
     let (rect, response) =
         ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+    context.editor.last_viewport_center = Some(rect.center());
+    if !ui.ctx().egui_wants_keyboard_input() {
+        if ui.input(|input| input.key_pressed(egui::Key::Slash)) {
+            if context.editor.isolated.is_some() {
+                context.editor.isolated = None;
+            } else if let Some(object) = *context.selected {
+                context.editor.isolated = Some(object);
+                focus_camera_on(
+                    project,
+                    Some(object),
+                    context.editor,
+                    context.zoom,
+                    context.pan,
+                );
+            }
+        } else if ui.input(|input| input.key_pressed(egui::Key::F)) {
+            if let Some(object) = *context.selected {
+                focus_camera_on(
+                    project,
+                    Some(object),
+                    context.editor,
+                    context.zoom,
+                    context.pan,
+                );
+            }
+        } else if ui.input(|input| input.key_pressed(egui::Key::Home)) {
+            focus_camera_on(
+                project,
+                context.editor.isolated,
+                context.editor,
+                context.zoom,
+                context.pan,
+            );
+        }
+    }
     let orbit_started = response.drag_started_by(egui::PointerButton::Middle)
         && !ui.input(|input| input.modifiers.shift);
     if orbit_started && let Some(object) = context.editor.hovered_object.or(*context.selected) {
@@ -1759,6 +1810,7 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             pan: *context.pan,
             perspective: *context.perspective,
             camera_frame: context.editor.camera_frame,
+            isolated: context.editor.isolated,
         },
     );
     context.editor.last_camera = rendered.camera;
@@ -1787,8 +1839,19 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
                 ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
             }
         });
-    let confirm_rotate = context.editor.rotate_session.is_some()
-        && ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary));
+    let confirm_rotate =
+        context
+            .editor
+            .rotate_session
+            .is_some_and(|session| match session.source {
+                RotateSource::Keyboard => {
+                    response.clicked_by(egui::PointerButton::Primary)
+                        || ui.input(|input| input.key_pressed(egui::Key::Enter))
+                }
+                RotateSource::Gizmo => {
+                    ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+                }
+            });
     let cancel_transform =
         transform_was_active && response.clicked_by(egui::PointerButton::Secondary);
     if confirm_move {
@@ -1979,6 +2042,7 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
             current_angle: 0.0,
             quarter_turns: 0,
             camera: *camera,
+            source: RotateSource::Gizmo,
         });
         return true;
     }
@@ -2060,6 +2124,15 @@ fn object_world_origin(project: &Project, object: ObjectRef) -> Option<Vec3> {
 }
 
 fn object_gizmo_center(project: &Project, object: ObjectRef) -> Option<Vec3> {
+    visible_voxel_bounds(project, Some(object))
+        .map(|(minimum, maximum)| bounds_center(minimum, maximum))
+        .or_else(|| object_world_origin(project, object))
+}
+
+fn visible_voxel_bounds(
+    project: &Project,
+    target: Option<ObjectRef>,
+) -> Option<(GridPosition, GridPosition)> {
     let mut minimum: Option<GridPosition> = None;
     let mut maximum: Option<GridPosition> = None;
     let mut include = |position: GridPosition| {
@@ -2082,7 +2155,9 @@ fn object_gizmo_center(project: &Project, object: ObjectRef) -> Option<Vec3> {
     for piece in project.pieces.values().filter(|piece| {
         piece.visible
             && group_chain_is_visible(project, piece.parent_group_id)
-            && object_is_selected(project, ObjectRef::Piece(piece.id), Some(object))
+            && target.is_none_or(|object| {
+                object_is_selected(project, ObjectRef::Piece(piece.id), Some(object))
+            })
     }) {
         for position in piece.beads.keys() {
             include(transformed_world_position(
@@ -2096,7 +2171,9 @@ fn object_gizmo_center(project: &Project, object: ObjectRef) -> Option<Vec3> {
     for shape in project.shapes.values().filter(|shape| {
         shape.visible
             && group_chain_is_visible(project, shape.parent_group_id)
-            && object_is_selected(project, ObjectRef::Shape(shape.id), Some(object))
+            && target.is_none_or(|object| {
+                object_is_selected(project, ObjectRef::Shape(shape.id), Some(object))
+            })
     }) {
         for position in shape.beads.keys() {
             include(transformed_world_position(
@@ -2108,13 +2185,48 @@ fn object_gizmo_center(project: &Project, object: ObjectRef) -> Option<Vec3> {
         }
     }
 
-    match (minimum, maximum) {
-        (Some(minimum), Some(maximum)) => Some(Vec3::new(
-            (minimum.x + maximum.x) as f32 * 0.5,
-            (minimum.y + maximum.y) as f32 * 0.5,
-            (minimum.z + maximum.z) as f32 * 0.5,
-        )),
-        _ => object_world_origin(project, object),
+    minimum.zip(maximum)
+}
+
+fn bounds_center(minimum: GridPosition, maximum: GridPosition) -> Vec3 {
+    Vec3::new(
+        (minimum.x + maximum.x) as f32 * 0.5,
+        (minimum.y + maximum.y) as f32 * 0.5,
+        (minimum.z + maximum.z) as f32 * 0.5,
+    )
+}
+
+fn focus_camera_on(
+    project: &Project,
+    target: Option<ObjectRef>,
+    editor: &mut AssemblyEditorState,
+    zoom: &mut f32,
+    pan: &mut egui::Vec2,
+) {
+    let frame = visible_voxel_bounds(project, target)
+        .map(|(minimum, maximum)| CameraFrame {
+            target: bounds_center(minimum, maximum),
+            span: Vec3::new(
+                (maximum.x - minimum.x + 1) as f32,
+                (maximum.y - minimum.y + 1) as f32,
+                (maximum.z - minimum.z + 1) as f32,
+            )
+            .max_element()
+            .max(1.0),
+        })
+        .or_else(|| {
+            target.and_then(|object| {
+                object_world_origin(project, object).map(|origin| CameraFrame {
+                    target: origin,
+                    span: 1.0,
+                })
+            })
+        });
+    if let Some(frame) = frame {
+        editor.camera_frame = Some(frame);
+        editor.last_camera = None;
+        *zoom = 1.0;
+        *pan = egui::Vec2::ZERO;
     }
 }
 
@@ -2316,7 +2428,6 @@ fn handle_assembly_shortcuts(
     project: &Project,
     selected: Option<ObjectRef>,
     state: &mut AssemblyEditorState,
-    commands: &mut Vec<PendingCommand>,
 ) {
     if ui.ctx().egui_wants_keyboard_input() {
         return;
@@ -2394,31 +2505,33 @@ fn handle_assembly_shortcuts(
         state.reset();
         return;
     };
-    let direction = if ui.input(|input| input.modifiers.shift) {
-        -1
-    } else {
-        1
-    };
-    let command = match shortcut {
-        TransformShortcut::Move => return,
+    match shortcut {
+        TransformShortcut::Move => {}
         TransformShortcut::Rotate => {
-            let Some(pivot_world) = object_rotation_pivot(project, object) else {
+            let (Some(pivot_world), Some(camera), Some(viewport_center), Some(pointer)) = (
+                object_rotation_pivot(project, object),
+                state.last_camera,
+                state.last_viewport_center,
+                ui.input(|input| input.pointer.hover_pos()),
+            ) else {
                 state.reset();
                 return;
             };
-            Command::RotateQuarterAround {
+            let center = world_to_screen(viewport_center, grid_to_vec3(pivot_world), &camera);
+            let start_parameter = rotation_ring_parameter(center, &camera, axis, pointer);
+            state.rotate_session = Some(RotateSession {
                 object,
                 axis,
-                quarter_turns: direction as i8,
                 pivot_world,
-            }
+                center,
+                start_parameter,
+                current_angle: 0.0,
+                quarter_turns: 0,
+                camera,
+                source: RotateSource::Keyboard,
+            });
         }
-    };
-    commands.push(PendingCommand {
-        command,
-        select_created: false,
-    });
-    state.reset();
+    }
 }
 
 fn update_rotate_preview(session: &mut RotateSession, pointer: egui::Pos2) {
@@ -2657,6 +2770,7 @@ struct RenderOptions {
     pan: egui::Vec2,
     perspective: bool,
     camera_frame: Option<CameraFrame>,
+    isolated: Option<ObjectRef>,
 }
 
 struct RenderOutput {
@@ -2674,7 +2788,11 @@ fn render_voxels(
     let visible_objects = project
         .pieces
         .values()
-        .filter(|piece| piece.visible && group_chain_is_visible(project, piece.parent_group_id))
+        .filter(|piece| {
+            piece.visible
+                && group_chain_is_visible(project, piece.parent_group_id)
+                && isolation_includes(project, ObjectRef::Piece(piece.id), options.isolated)
+        })
         .map(|piece| {
             (
                 ObjectRef::Piece(piece.id),
@@ -2688,7 +2806,9 @@ fn render_voxels(
                 .shapes
                 .values()
                 .filter(|shape| {
-                    shape.visible && group_chain_is_visible(project, shape.parent_group_id)
+                    shape.visible
+                        && group_chain_is_visible(project, shape.parent_group_id)
+                        && isolation_includes(project, ObjectRef::Shape(shape.id), options.isolated)
                 })
                 .map(|shape| {
                     (
@@ -2867,6 +2987,10 @@ fn object_is_selected(project: &Project, object: ObjectRef, selected: Option<Obj
         }
         _ => false,
     }
+}
+
+fn isolation_includes(project: &Project, object: ObjectRef, isolated: Option<ObjectRef>) -> bool {
+    isolated.is_none_or(|target| object_is_selected(project, object, Some(target)))
 }
 
 fn pick_rendered_object(faces: &[RenderFace], pointer: egui::Pos2) -> Option<ObjectRef> {
@@ -3336,6 +3460,7 @@ mod presentation_tests {
             current_angle: 0.0,
             quarter_turns: 0,
             camera,
+            source: RotateSource::Keyboard,
         };
 
         update_rotate_preview(&mut session, egui::pos2(0.0, -ROTATE_GIZMO_RADIUS));
@@ -3425,6 +3550,67 @@ mod presentation_tests {
                 .abs()
                 < 0.01
         );
+    }
+
+    #[test]
+    fn focus_uses_selected_bounds_and_resets_pan_and_zoom() {
+        let mut project = Project::new("focus");
+        let root = project.root_group_id();
+        let piece = project
+            .create_piece(root, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+        for position in [GridPosition::new(-2, 0, 0), GridPosition::new(4, 2, 0)] {
+            project
+                .add_bead(
+                    VoxelObjectRef::Piece(piece),
+                    Bead {
+                        position,
+                        color: Color::RED,
+                    },
+                )
+                .unwrap();
+        }
+        let mut editor = AssemblyEditorState::default();
+        let mut zoom = 3.0;
+        let mut pan = egui::vec2(20.0, -10.0);
+
+        focus_camera_on(
+            &project,
+            Some(ObjectRef::Piece(piece)),
+            &mut editor,
+            &mut zoom,
+            &mut pan,
+        );
+
+        let frame = editor.camera_frame.unwrap();
+        assert_eq!(frame.target, Vec3::new(1.0, 1.0, 0.0));
+        assert_eq!(frame.span, 7.0);
+        assert_eq!(zoom, 1.0);
+        assert_eq!(pan, egui::Vec2::ZERO);
+    }
+
+    #[test]
+    fn isolation_includes_only_the_selected_group_descendants() {
+        let mut project = Project::new("isolation");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "group").unwrap();
+        let inside = project
+            .create_piece(group, "inside", Plane::Xy { z: 0 })
+            .unwrap();
+        let outside = project
+            .create_piece(root, "outside", Plane::Xy { z: 0 })
+            .unwrap();
+
+        assert!(isolation_includes(
+            &project,
+            ObjectRef::Piece(inside),
+            Some(ObjectRef::Group(group))
+        ));
+        assert!(!isolation_includes(
+            &project,
+            ObjectRef::Piece(outside),
+            Some(ObjectRef::Group(group))
+        ));
     }
 }
 
