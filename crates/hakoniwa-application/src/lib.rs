@@ -3,8 +3,8 @@
 use std::{collections::BTreeSet, path::Path};
 
 use hakoniwa_domain::{
-    Bead, Color, DomainError, GridPosition, ObjectId, ObjectRef, OrthogonalOrientation, Placement,
-    Plane, Project, VoxelObjectRef,
+    Bead, Color, DomainError, GridAxis, GridPosition, ObjectId, ObjectRef, OrthogonalOrientation,
+    Placement, Plane, Project, VoxelObjectRef,
 };
 
 pub trait ProjectRepository {
@@ -61,6 +61,11 @@ pub enum Command {
     SetOrientation {
         object: ObjectRef,
         orientation: OrthogonalOrientation,
+    },
+    RotateQuarter {
+        object: ObjectRef,
+        axis: GridAxis,
+        quarter_turns: i8,
     },
     SetVisibility {
         object: ObjectRef,
@@ -279,6 +284,15 @@ fn apply_command(project: &mut Project, command: Command) -> Result<CommandResul
             placement.orientation = orientation;
             record_affected_pieces(project, object, &mut result.changes);
             project.set_placement(object, placement)?;
+            record_object(&mut result.changes, object);
+        }
+        Command::RotateQuarter {
+            object,
+            axis,
+            quarter_turns,
+        } => {
+            record_affected_pieces(project, object, &mut result.changes);
+            project.rotate_object_quarter(object, axis, quarter_turns)?;
             record_object(&mut result.changes, object);
         }
         Command::SetVisibility { object, visible } => {
@@ -504,6 +518,7 @@ mod tests {
                 placement: Placement {
                     translation: GridPosition::new(4, 5, 6),
                     orientation: OrthogonalOrientation::Yz,
+                    ..Placement::default()
                 },
             })
             .unwrap();
@@ -612,6 +627,24 @@ mod tests {
             editor.project().child_objects(root),
             vec![ObjectRef::Piece(second), ObjectRef::Piece(first)]
         );
+    }
+
+    #[test]
+    fn quarter_rotation_is_undoable() {
+        let (mut editor, piece) = piece_editor();
+        let before = editor.project().pieces[&piece].placement.rotation;
+        editor
+            .execute(Command::RotateQuarter {
+                object: ObjectRef::Piece(piece),
+                axis: GridAxis::X,
+                quarter_turns: 1,
+            })
+            .unwrap();
+        assert_ne!(editor.project().pieces[&piece].placement.rotation, before);
+        assert!(editor.undo());
+        assert_eq!(editor.project().pieces[&piece].placement.rotation, before);
+        assert!(editor.redo());
+        assert_ne!(editor.project().pieces[&piece].placement.rotation, before);
     }
 
     #[test]

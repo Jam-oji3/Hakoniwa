@@ -4,7 +4,8 @@ use eframe::egui;
 use glam::{Quat, Vec3};
 use hakoniwa_application::{Command, Editor, ProjectRepository};
 use hakoniwa_domain::{
-    Bead, Color, GridPosition, ObjectId, ObjectRef, Piece, Plane, Project, VoxelObjectRef,
+    Bead, Color, GridAxis, GridPosition, ObjectId, ObjectRef, Piece, Placement, Plane, Project,
+    VoxelObjectRef,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -42,6 +43,7 @@ pub struct HakoniwaApp<R: ProjectRepository> {
     selected: Option<ObjectRef>,
     piece_editor: PieceEditorState,
     tree_editor: TreeEditorState,
+    assembly_editor: AssemblyEditorState,
     status: String,
     zoom: f32,
     orientation: Quat,
@@ -79,6 +81,7 @@ impl<R: ProjectRepository> HakoniwaApp<R> {
             selected: None,
             piece_editor: PieceEditorState::default(),
             tree_editor: TreeEditorState::default(),
+            assembly_editor: AssemblyEditorState::default(),
             status: "ハンマーのMVPサンプルを読み込みました".into(),
             zoom: 1.0,
             orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
@@ -139,6 +142,7 @@ where
                 self.editor = Editor::new(hammer_project());
                 self.selected = None;
                 self.piece_editor.reset();
+                self.assembly_editor.reset();
                 self.status = "ハンマーを作成しました".into();
             }
             let undo_requested = ui
@@ -187,6 +191,7 @@ where
                         self.editor = Editor::new(project);
                         self.selected = None;
                         self.piece_editor.reset();
+                        self.assembly_editor.reset();
                         self.file_path = path.to_string_lossy().into_owned();
                         self.status = format!("読み込みました: {}", path.display());
                     }
@@ -224,6 +229,7 @@ where
                 selected: &mut self.selected,
                 piece_editor: &mut self.piece_editor,
                 tree_editor: &mut self.tree_editor,
+                assembly_editor: &mut self.assembly_editor,
                 zoom: &mut self.zoom,
                 orientation: &mut self.orientation,
                 pan: &mut self.pan,
@@ -311,6 +317,7 @@ struct WorkspaceBehavior<'a> {
     selected: &'a mut Option<ObjectRef>,
     piece_editor: &'a mut PieceEditorState,
     tree_editor: &'a mut TreeEditorState,
+    assembly_editor: &'a mut AssemblyEditorState,
     zoom: &'a mut f32,
     orientation: &'a mut Quat,
     pan: &'a mut egui::Vec2,
@@ -351,11 +358,15 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
             WorkspacePane::AssemblyView => draw_preview(
                 ui,
                 self.project,
-                self.selected,
-                self.zoom,
-                self.orientation,
-                self.pan,
-                self.perspective,
+                PreviewContext {
+                    selected: self.selected,
+                    editor: self.assembly_editor,
+                    commands: &mut self.commands,
+                    zoom: self.zoom,
+                    orientation: self.orientation,
+                    pan: self.pan,
+                    perspective: self.perspective,
+                },
             ),
             WorkspacePane::Inspector => draw_inspector(ui, self.project, *self.selected),
         }
@@ -483,6 +494,31 @@ impl TreeEditorState {
         self.renaming = Some(object);
         self.rename_buffer = current_name.to_owned();
         self.focus_rename = true;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransformShortcut {
+    Move,
+    Rotate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum TransformTool {
+    #[default]
+    Move,
+    Rotate,
+}
+
+#[derive(Default)]
+struct AssemblyEditorState {
+    shortcut: Option<TransformShortcut>,
+    tool: TransformTool,
+}
+
+impl AssemblyEditorState {
+    fn reset(&mut self) {
+        self.shortcut = None;
     }
 }
 
@@ -1536,24 +1572,51 @@ const fn plane_label(plane: Plane) -> &'static str {
     }
 }
 
-fn draw_preview(
-    ui: &mut egui::Ui,
-    project: &Project,
-    selected: &mut Option<ObjectRef>,
-    zoom: &mut f32,
-    orientation: &mut Quat,
-    pan: &mut egui::Vec2,
-    perspective: &mut bool,
-) {
+struct PreviewContext<'a> {
+    selected: &'a mut Option<ObjectRef>,
+    editor: &'a mut AssemblyEditorState,
+    commands: &'a mut Vec<PendingCommand>,
+    zoom: &'a mut f32,
+    orientation: &'a mut Quat,
+    pan: &'a mut egui::Vec2,
+    perspective: &'a mut bool,
+}
+
+fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_>) {
+    handle_assembly_shortcuts(
+        ui,
+        project,
+        *context.selected,
+        context.editor,
+        context.commands,
+    );
     ui.horizontal(|ui| {
-        ui.checkbox(perspective, "透視投影");
+        ui.selectable_value(&mut context.editor.tool, TransformTool::Move, "移動ギズモ");
+        ui.selectable_value(
+            &mut context.editor.tool,
+            TransformTool::Rotate,
+            "回転ギズモ",
+        );
+        ui.separator();
+        ui.checkbox(context.perspective, "透視投影");
         if ui.button("ビューをリセット").clicked() {
-            *orientation = Quat::from_rotation_x(-35.0_f32.to_radians())
+            *context.orientation = Quat::from_rotation_x(-35.0_f32.to_radians())
                 * Quat::from_rotation_z(45.0_f32.to_radians());
-            *zoom = 1.0;
-            *pan = egui::Vec2::ZERO;
+            *context.zoom = 1.0;
+            *context.pan = egui::Vec2::ZERO;
         }
     });
+    if let Some(shortcut) = context.editor.shortcut {
+        let action = match shortcut {
+            TransformShortcut::Move => "移動",
+            TransformShortcut::Rotate => "90°回転",
+        };
+        ui.colored_label(
+            egui::Color32::from_rgb(210, 105, 15),
+            format!("{action}: X / Y / Zで軸を指定 · Shiftで負方向 · Escで取消"),
+        );
+    }
+    ui.label("ギズモ軸をクリック: +1マス / +90° · Shift+クリック: 逆方向 · G/R → X/Y/Z");
     ui.label("中ホイールドラッグ: Turntable回転 / Shift+中ホイール: 移動 / ホイール: ズーム");
     let (rect, response) =
         ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -1562,34 +1625,342 @@ fn draw_preview(
             if input.pointer.button_down(egui::PointerButton::Middle) {
                 let delta = input.pointer.delta();
                 if input.modifiers.shift {
-                    *pan += delta;
+                    *context.pan += delta;
                 } else {
-                    apply_turntable_drag(orientation, delta);
+                    apply_turntable_drag(context.orientation, delta);
                 }
             }
             if input.smooth_scroll_delta.y != 0.0 {
-                *zoom = (*zoom * (1.0 + input.smooth_scroll_delta.y * 0.001)).clamp(0.1, 8.0);
+                *context.zoom =
+                    (*context.zoom * (1.0 + input.smooth_scroll_delta.y * 0.001)).clamp(0.1, 8.0);
             }
         });
     }
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
-    let faces = render_voxels(
+    let rendered = render_voxels(
         &painter,
         rect,
         project,
         RenderOptions {
-            selected: *selected,
-            orientation: *orientation,
-            zoom: *zoom,
-            pan: *pan,
-            perspective: *perspective,
+            selected: *context.selected,
+            orientation: *context.orientation,
+            zoom: *context.zoom,
+            pan: *context.pan,
+            perspective: *context.perspective,
         },
     );
+    let gizmo_pointer = ui
+        .input(|input| input.pointer.hover_pos())
+        .filter(|pointer| rect.contains(*pointer));
+    let gizmo_handled = draw_transform_gizmo(GizmoContext {
+        ui,
+        painter: &painter,
+        rect,
+        pointer: gizmo_pointer,
+        project,
+        selected: *context.selected,
+        tool: context.editor.tool,
+        camera: rendered.camera.as_ref(),
+        clicked: response.clicked_by(egui::PointerButton::Primary),
+        commands: context.commands,
+    });
     if response.clicked_by(egui::PointerButton::Primary)
+        && !gizmo_handled
         && let Some(pointer) = response.interact_pointer_pos()
     {
-        *selected = pick_rendered_object(&faces, pointer);
+        *context.selected = pick_rendered_object(&rendered.faces, pointer);
+    }
+}
+
+struct GizmoContext<'a> {
+    ui: &'a egui::Ui,
+    painter: &'a egui::Painter,
+    rect: egui::Rect,
+    pointer: Option<egui::Pos2>,
+    project: &'a Project,
+    selected: Option<ObjectRef>,
+    tool: TransformTool,
+    camera: Option<&'a Camera>,
+    clicked: bool,
+    commands: &'a mut Vec<PendingCommand>,
+}
+
+fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
+    let (Some(object), Some(camera)) = (context.selected, context.camera) else {
+        return false;
+    };
+    let Some(origin) = object_world_origin(context.project, object) else {
+        return false;
+    };
+    let center = world_to_screen(context.rect.center(), origin, camera);
+    let axes = [GridAxis::X, GridAxis::Y, GridAxis::Z];
+    let hovered = match context.tool {
+        TransformTool::Move => axes.into_iter().find(|axis| {
+            context.pointer.is_some_and(|pointer| {
+                let end = center + projected_axis_direction(camera, *axis) * 48.0;
+                distance_to_segment(pointer, center, end) <= 7.0
+            })
+        }),
+        TransformTool::Rotate => axes.into_iter().find(|axis| {
+            let ring = rotation_ring_points(center, camera, *axis);
+            context
+                .pointer
+                .is_some_and(|pointer| distance_to_polyline(pointer, &ring) <= 7.0)
+        }),
+    };
+
+    for axis in axes {
+        let color = axis_color(axis);
+        let width = if hovered == Some(axis) { 4.0 } else { 2.5 };
+        match context.tool {
+            TransformTool::Move => {
+                let end = center + projected_axis_direction(camera, axis) * 48.0;
+                context
+                    .painter
+                    .line_segment([center, end], egui::Stroke::new(width, color));
+                context.painter.circle_filled(end, 5.0, color);
+                context.painter.text(
+                    end + egui::vec2(7.0, 0.0),
+                    egui::Align2::LEFT_CENTER,
+                    axis_label(axis),
+                    egui::FontId::proportional(12.0),
+                    color,
+                );
+            }
+            TransformTool::Rotate => {
+                let ring = rotation_ring_points(center, camera, axis);
+                context
+                    .painter
+                    .add(egui::Shape::line(ring, egui::Stroke::new(width, color)));
+            }
+        }
+    }
+    context
+        .painter
+        .circle_filled(center, 4.0, egui::Color32::from_rgb(245, 245, 245));
+
+    if !context.clicked || hovered.is_none() {
+        return false;
+    }
+    let axis = hovered.expect("hovered axis was checked");
+    let direction = if context.ui.input(|input| input.modifiers.shift) {
+        -1
+    } else {
+        1
+    };
+    let command = match context.tool {
+        TransformTool::Move => {
+            let Some(mut placement) = placement_for_object(context.project, object) else {
+                return false;
+            };
+            match axis {
+                GridAxis::X => placement.translation.x += direction,
+                GridAxis::Y => placement.translation.y += direction,
+                GridAxis::Z => placement.translation.z += direction,
+            }
+            Command::SetPlacement { object, placement }
+        }
+        TransformTool::Rotate => Command::RotateQuarter {
+            object,
+            axis,
+            quarter_turns: direction as i8,
+        },
+    };
+    context.commands.push(PendingCommand {
+        command,
+        select_created: false,
+    });
+    true
+}
+
+fn object_world_origin(project: &Project, object: ObjectRef) -> Option<Vec3> {
+    let position = match object {
+        ObjectRef::Group(id) => {
+            let group = project.groups.get(&id)?;
+            if let Some(parent) = group.parent_group_id {
+                transformed_world_position(project, parent, group.placement, GridPosition::ZERO)
+            } else {
+                group.placement.translation
+            }
+        }
+        ObjectRef::Shape(id) => {
+            let shape = project.shapes.get(&id)?;
+            transformed_world_position(
+                project,
+                shape.parent_group_id,
+                shape.placement,
+                GridPosition::ZERO,
+            )
+        }
+        ObjectRef::Piece(id) => {
+            let piece = project.pieces.get(&id)?;
+            transformed_world_position(
+                project,
+                piece.parent_group_id,
+                piece.placement,
+                GridPosition::ZERO,
+            )
+        }
+    };
+    Some(Vec3::new(
+        position.x as f32,
+        position.y as f32,
+        position.z as f32,
+    ))
+}
+
+fn world_to_screen(center: egui::Pos2, world: Vec3, camera: &Camera) -> egui::Pos2 {
+    project_point(center, camera.orientation * (world - camera.target), camera)
+}
+
+fn projected_axis_direction(camera: &Camera, axis: GridAxis) -> egui::Vec2 {
+    let projected = camera.orientation * axis_vector(axis);
+    egui::vec2(projected.x, -projected.y).normalized()
+}
+
+fn rotation_ring_points(center: egui::Pos2, camera: &Camera, axis: GridAxis) -> Vec<egui::Pos2> {
+    let (first, second) = match axis {
+        GridAxis::X => (Vec3::Y, Vec3::Z),
+        GridAxis::Y => (Vec3::Z, Vec3::X),
+        GridAxis::Z => (Vec3::X, Vec3::Y),
+    };
+    let mut points = (0..=40)
+        .map(|index| {
+            let angle = index as f32 / 40.0 * std::f32::consts::TAU;
+            let camera_point = camera.orientation * (first * angle.cos() + second * angle.sin());
+            center + egui::vec2(camera_point.x, -camera_point.y) * 34.0
+        })
+        .collect::<Vec<_>>();
+    if points.len() >= 2 && points[0] == *points.last().unwrap() {
+        points.pop();
+        points.push(points[0]);
+    }
+    points
+}
+
+const fn axis_vector(axis: GridAxis) -> Vec3 {
+    match axis {
+        GridAxis::X => Vec3::X,
+        GridAxis::Y => Vec3::Y,
+        GridAxis::Z => Vec3::Z,
+    }
+}
+
+const fn axis_color(axis: GridAxis) -> egui::Color32 {
+    match axis {
+        GridAxis::X => egui::Color32::from_rgb(210, 55, 55),
+        GridAxis::Y => egui::Color32::from_rgb(45, 160, 75),
+        GridAxis::Z => egui::Color32::from_rgb(55, 105, 220),
+    }
+}
+
+const fn axis_label(axis: GridAxis) -> &'static str {
+    match axis {
+        GridAxis::X => "X",
+        GridAxis::Y => "Y",
+        GridAxis::Z => "Z",
+    }
+}
+
+fn distance_to_polyline(point: egui::Pos2, points: &[egui::Pos2]) -> f32 {
+    points
+        .windows(2)
+        .map(|segment| distance_to_segment(point, segment[0], segment[1]))
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn distance_to_segment(point: egui::Pos2, start: egui::Pos2, end: egui::Pos2) -> f32 {
+    let segment = end - start;
+    let length_squared = segment.length_sq();
+    if length_squared <= f32::EPSILON {
+        return point.distance(start);
+    }
+    let fraction = ((point - start).dot(segment) / length_squared).clamp(0.0, 1.0);
+    point.distance(start + segment * fraction)
+}
+
+fn handle_assembly_shortcuts(
+    ui: &egui::Ui,
+    project: &Project,
+    selected: Option<ObjectRef>,
+    state: &mut AssemblyEditorState,
+    commands: &mut Vec<PendingCommand>,
+) {
+    if ui.ctx().egui_wants_keyboard_input() {
+        return;
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+        state.reset();
+        return;
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::G)) && selected.is_some() {
+        state.shortcut = Some(TransformShortcut::Move);
+        state.tool = TransformTool::Move;
+        return;
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::R)) && selected.is_some() {
+        state.shortcut = Some(TransformShortcut::Rotate);
+        state.tool = TransformTool::Rotate;
+        return;
+    }
+    let Some(shortcut) = state.shortcut else {
+        return;
+    };
+    let axis = ui.input(|input| {
+        if input.key_pressed(egui::Key::X) {
+            Some(GridAxis::X)
+        } else if input.key_pressed(egui::Key::Y) {
+            Some(GridAxis::Y)
+        } else if input.key_pressed(egui::Key::Z) {
+            Some(GridAxis::Z)
+        } else {
+            None
+        }
+    });
+    let Some(axis) = axis else {
+        return;
+    };
+    let Some(object) = selected else {
+        state.reset();
+        return;
+    };
+    let direction = if ui.input(|input| input.modifiers.shift) {
+        -1
+    } else {
+        1
+    };
+    let command = match shortcut {
+        TransformShortcut::Move => {
+            let Some(mut placement) = placement_for_object(project, object) else {
+                state.reset();
+                return;
+            };
+            match axis {
+                GridAxis::X => placement.translation.x += direction,
+                GridAxis::Y => placement.translation.y += direction,
+                GridAxis::Z => placement.translation.z += direction,
+            }
+            Command::SetPlacement { object, placement }
+        }
+        TransformShortcut::Rotate => Command::RotateQuarter {
+            object,
+            axis,
+            quarter_turns: direction as i8,
+        },
+    };
+    commands.push(PendingCommand {
+        command,
+        select_created: false,
+    });
+    state.reset();
+}
+
+fn placement_for_object(project: &Project, object: ObjectRef) -> Option<Placement> {
+    match object {
+        ObjectRef::Group(id) => project.groups.get(&id).map(|group| group.placement),
+        ObjectRef::Shape(id) => project.shapes.get(&id).map(|shape| shape.placement),
+        ObjectRef::Piece(id) => project.pieces.get(&id).map(|piece| piece.placement),
     }
 }
 
@@ -1621,6 +1992,7 @@ fn apply_turntable_drag(orientation: &mut Quat, delta: egui::Vec2) {
     *orientation = (*orientation * pitch * yaw).normalize();
 }
 
+#[derive(Clone, Copy)]
 struct Camera {
     orientation: Quat,
     target: Vec3,
@@ -1646,12 +2018,17 @@ struct RenderOptions {
     perspective: bool,
 }
 
+struct RenderOutput {
+    faces: Vec<RenderFace>,
+    camera: Option<Camera>,
+}
+
 fn render_voxels(
     painter: &egui::Painter,
     rect: egui::Rect,
     project: &Project,
     options: RenderOptions,
-) -> Vec<RenderFace> {
+) -> RenderOutput {
     let visible_objects = project
         .pieces
         .values()
@@ -1685,17 +2062,15 @@ fn render_voxels(
         .iter()
         .flat_map(|(_, parent_group_id, placement, beads)| {
             beads.keys().map(|position| {
-                translated_world_position(
-                    project,
-                    *parent_group_id,
-                    placement.translation,
-                    *position,
-                )
+                transformed_world_position(project, *parent_group_id, *placement, *position)
             })
         })
         .collect::<BTreeSet<_>>();
     if occupied.is_empty() {
-        return Vec::new();
+        return RenderOutput {
+            faces: Vec::new(),
+            camera: None,
+        };
     }
     let min = Vec3::new(
         occupied.iter().map(|p| p.x).min().unwrap() as f32,
@@ -1723,12 +2098,7 @@ fn render_voxels(
                 &mut faces,
                 rect.center(),
                 object,
-                translated_world_position(
-                    project,
-                    parent_group_id,
-                    placement.translation,
-                    *position,
-                ),
+                transformed_world_position(project, parent_group_id, placement, *position),
                 *color,
                 &occupied,
                 &camera,
@@ -1753,7 +2123,10 @@ fn render_voxels(
             egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 132, 18)),
         );
     }
-    faces
+    RenderOutput {
+        faces,
+        camera: Some(camera),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1799,18 +2172,24 @@ fn quantized_screen_point(point: egui::Pos2) -> (i32, i32) {
     )
 }
 
-fn translated_world_position(
+fn transformed_world_position(
     project: &Project,
     mut parent_group_id: ObjectId,
-    object_translation: GridPosition,
+    object_placement: Placement,
     position: GridPosition,
 ) -> GridPosition {
-    let mut world = add_grid_positions(position, object_translation);
+    let mut world = add_grid_positions(
+        object_placement.rotation.apply(position),
+        object_placement.translation,
+    );
     loop {
         let Some(group) = project.groups.get(&parent_group_id) else {
             return world;
         };
-        world = add_grid_positions(world, group.placement.translation);
+        world = add_grid_positions(
+            group.placement.rotation.apply(world),
+            group.placement.translation,
+        );
         let Some(parent) = group.parent_group_id else {
             return world;
         };
@@ -2168,13 +2547,34 @@ mod presentation_tests {
             .translation = GridPosition::new(0, 2, 0);
 
         assert_eq!(
-            translated_world_position(
+            transformed_world_position(
                 &project,
                 group,
-                GridPosition::new(0, 0, 3),
+                Placement {
+                    translation: GridPosition::new(0, 0, 3),
+                    ..Placement::default()
+                },
                 GridPosition::new(4, 5, 6)
             ),
             GridPosition::new(5, 7, 9)
+        );
+    }
+
+    #[test]
+    fn object_and_group_rotations_are_composed_for_rendering() {
+        let mut project = Project::new("rotation");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "group").unwrap();
+        project.groups.get_mut(&group).unwrap().placement.rotation =
+            Placement::default().rotation.rotate_quarter(GridAxis::Z, 1);
+        let placement = Placement {
+            translation: GridPosition::new(1, 0, 0),
+            ..Placement::default()
+        };
+
+        assert_eq!(
+            transformed_world_position(&project, group, placement, GridPosition::new(1, 0, 0)),
+            GridPosition::new(0, 2, 0)
         );
     }
 }

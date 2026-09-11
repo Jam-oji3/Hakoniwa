@@ -33,7 +33,7 @@
 - Pieceのローカル平面
 - PDF用紙と組立ガイド有無を含む出力設定
 
-格子座標は`"x,y,z"`形式の文字列として表現する。色は`[r,g,b]`、平面は`{"Xy":{"z":0}}`、`{"Xz":{"y":0}}`、`{"Yz":{"x":0}}`のいずれかである。姿勢は`"Xy"`、`"Xz"`、`"Yz"`のいずれかであり、任意角度は保存できない。
+格子座標は`"x,y,z"`形式の文字列として表現する。色は`[r,g,b]`、平面は`{"Xy":{"z":0}}`、`{"Xz":{"y":0}}`、`{"Yz":{"x":0}}`のいずれかである。Pieceの基準面は`orientation`の`"Xy"`、`"Xz"`、`"Yz"`で表す。Assembly上の回転は`rotation.matrix`の整数直交行列で表し、90度単位の24姿勢だけを保存できる。旧v2データで`rotation`が欠けている場合は単位行列として読み込む。
 
 すべてのコレクションは安定IDまたは座標順の決定的な順序で保存する。同じProjectを複数回保存した場合、`project.json`だけでなくZIP全体が同じバイト列になるよう、エントリ順、圧縮方式、タイムスタンプ、権限値を固定する。
 
@@ -57,7 +57,8 @@
         "sibling_order": 0,
         "placement": {
           "translation": "0,0,0",
-          "orientation": "Xy"
+          "orientation": "Xy",
+          "rotation": { "matrix": [[1,0,0],[0,1,0],[0,0,1]] }
         },
         "visible": true
       }
@@ -95,7 +96,8 @@
         "sibling_order": 0,
         "placement": {
           "translation": "0,0,0",
-          "orientation": "Xy"
+          "orientation": "Xy",
+          "rotation": { "matrix": [[1,0,0],[0,1,0],[0,0,1]] }
         },
         "visible": true
       }
@@ -109,7 +111,8 @@
         "sibling_order": 0,
         "placement": {
           "translation": "0,0,0",
-          "orientation": "Xy"
+          "orientation": "Xy",
+          "rotation": { "matrix": [[1,0,0],[0,1,0],[0,0,1]] }
         },
         "visible": true,
         "plane": { "Xy": { "z": 0 } },
@@ -124,7 +127,8 @@
         "sibling_order": 1,
         "placement": {
           "translation": "0,0,0",
-          "orientation": "Xz"
+          "orientation": "Xz",
+          "rotation": { "matrix": [[1,0,0],[0,1,0],[0,0,1]] }
         },
         "visible": true,
         "plane": { "Xz": { "y": 0 } },

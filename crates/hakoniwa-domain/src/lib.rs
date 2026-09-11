@@ -56,9 +56,111 @@ pub enum OrthogonalOrientation {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum GridAxis {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct GridRotation {
+    matrix: [[i8; 3]; 3],
+}
+
+impl GridRotation {
+    pub const IDENTITY: Self = Self {
+        matrix: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+    };
+
+    #[must_use]
+    pub const fn apply(self, position: GridPosition) -> GridPosition {
+        let values = [position.x, position.y, position.z];
+        GridPosition::new(
+            self.matrix[0][0] as i32 * values[0]
+                + self.matrix[0][1] as i32 * values[1]
+                + self.matrix[0][2] as i32 * values[2],
+            self.matrix[1][0] as i32 * values[0]
+                + self.matrix[1][1] as i32 * values[1]
+                + self.matrix[1][2] as i32 * values[2],
+            self.matrix[2][0] as i32 * values[0]
+                + self.matrix[2][1] as i32 * values[1]
+                + self.matrix[2][2] as i32 * values[2],
+        )
+    }
+
+    #[must_use]
+    pub fn rotate_quarter(self, axis: GridAxis, quarter_turns: i8) -> Self {
+        let turn = match axis {
+            GridAxis::X => Self {
+                matrix: [[1, 0, 0], [0, 0, -1], [0, 1, 0]],
+            },
+            GridAxis::Y => Self {
+                matrix: [[0, 0, 1], [0, 1, 0], [-1, 0, 0]],
+            },
+            GridAxis::Z => Self {
+                matrix: [[0, -1, 0], [1, 0, 0], [0, 0, 1]],
+            },
+        };
+        let mut result = self;
+        for _ in 0..quarter_turns.rem_euclid(4) {
+            result = turn.compose(result);
+        }
+        result
+    }
+
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        let rows_are_unit = self
+            .matrix
+            .iter()
+            .all(|row| row.iter().map(|value| value.unsigned_abs()).sum::<u8>() == 1);
+        let columns_are_unit = (0..3).all(|column| {
+            (0..3)
+                .map(|row| self.matrix[row][column].unsigned_abs())
+                .sum::<u8>()
+                == 1
+        });
+        rows_are_unit && columns_are_unit && self.determinant() == 1
+    }
+
+    const fn compose(self, right: Self) -> Self {
+        let mut matrix = [[0; 3]; 3];
+        let mut row = 0;
+        while row < 3 {
+            let mut column = 0;
+            while column < 3 {
+                let mut index = 0;
+                while index < 3 {
+                    matrix[row][column] += self.matrix[row][index] * right.matrix[index][column];
+                    index += 1;
+                }
+                column += 1;
+            }
+            row += 1;
+        }
+        Self { matrix }
+    }
+
+    const fn determinant(self) -> i8 {
+        let m = self.matrix;
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+            - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+            + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    }
+}
+
+impl Default for GridRotation {
+    fn default() -> Self {
+        Self::IDENTITY
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Placement {
     pub translation: GridPosition,
     pub orientation: OrthogonalOrientation,
+    #[serde(default)]
+    pub rotation: GridRotation,
 }
 
 impl Default for Placement {
@@ -66,6 +168,7 @@ impl Default for Placement {
         Self {
             translation: GridPosition::ZERO,
             orientation: OrthogonalOrientation::Xy,
+            rotation: GridRotation::IDENTITY,
         }
     }
 }
@@ -607,6 +710,39 @@ impl Project {
         Ok(())
     }
 
+    pub fn rotate_object_quarter(
+        &mut self,
+        object: ObjectRef,
+        axis: GridAxis,
+        quarter_turns: i8,
+    ) -> Result<(), DomainError> {
+        let placement = match object {
+            ObjectRef::Group(id) => {
+                &mut self
+                    .groups
+                    .get_mut(&id)
+                    .ok_or(DomainError::GroupNotFound(id))?
+                    .placement
+            }
+            ObjectRef::Shape(id) => {
+                &mut self
+                    .shapes
+                    .get_mut(&id)
+                    .ok_or(DomainError::ShapeNotFound(id))?
+                    .placement
+            }
+            ObjectRef::Piece(id) => {
+                &mut self
+                    .pieces
+                    .get_mut(&id)
+                    .ok_or(DomainError::PieceNotFound(id))?
+                    .placement
+            }
+        };
+        placement.rotation = placement.rotation.rotate_quarter(axis, quarter_turns);
+        Ok(())
+    }
+
     pub fn set_visibility(&mut self, object: ObjectRef, visible: bool) -> Result<(), DomainError> {
         match object {
             ObjectRef::Group(id) => {
@@ -846,6 +982,9 @@ impl Project {
             if !ids.insert(*id) {
                 return Err(DomainError::DuplicateObjectId(*id));
             }
+            if !group.placement.rotation.is_valid() {
+                return Err(DomainError::InvalidGridRotation(ObjectRef::Group(*id)));
+            }
             if *id != self.root_group_id() {
                 let parent = group
                     .parent_group_id
@@ -870,12 +1009,18 @@ impl Project {
             if !ids.insert(*id) {
                 return Err(DomainError::DuplicateObjectId(*id));
             }
+            if !shape.placement.rotation.is_valid() {
+                return Err(DomainError::InvalidGridRotation(ObjectRef::Shape(*id)));
+            }
             self.require_group(shape.parent_group_id)?;
         }
         for (id, piece) in &self.pieces {
             self.validate_map_id(*id, piece.id)?;
             if !ids.insert(*id) {
                 return Err(DomainError::DuplicateObjectId(*id));
+            }
+            if !piece.placement.rotation.is_valid() {
+                return Err(DomainError::InvalidGridRotation(ObjectRef::Piece(*id)));
             }
             self.require_group(piece.parent_group_id)?;
             piece.validate()?;
@@ -1101,6 +1246,7 @@ pub enum DomainError {
     CannotDeleteRootGroup,
     CannotReparentRootGroup,
     InvalidSiblingTarget(ObjectRef),
+    InvalidGridRotation(ObjectRef),
     GroupIsNotEmpty(ObjectId),
     HierarchyCycle(ObjectId),
     InvalidRootGroup(ObjectId),
@@ -1363,5 +1509,51 @@ mod tests {
             vec![ObjectRef::Piece(target), ObjectRef::Piece(moving)]
         );
         assert_eq!(project.pieces[&moving].parent_group_id, right);
+    }
+
+    #[test]
+    fn quarter_turns_form_the_24_valid_cube_rotations() {
+        let rotated = GridRotation::IDENTITY.rotate_quarter(GridAxis::Z, 1);
+        assert_eq!(
+            rotated.apply(GridPosition::new(1, 2, 3)),
+            GridPosition::new(-2, 1, 3)
+        );
+        assert_eq!(
+            GridRotation::IDENTITY.rotate_quarter(GridAxis::X, 4),
+            GridRotation::IDENTITY
+        );
+
+        let mut rotations = BTreeSet::new();
+        for x in 0..4 {
+            for y in 0..4 {
+                for z in 0..4 {
+                    let rotation = GridRotation::IDENTITY
+                        .rotate_quarter(GridAxis::X, x)
+                        .rotate_quarter(GridAxis::Y, y)
+                        .rotate_quarter(GridAxis::Z, z);
+                    assert!(rotation.is_valid());
+                    rotations.insert(rotation);
+                }
+            }
+        }
+        assert_eq!(rotations.len(), 24);
+    }
+
+    #[test]
+    fn projects_without_rotation_data_load_as_identity() {
+        let project = Project::new("legacy v2");
+        let root = project.root_group_id().to_string();
+        let mut value = serde_json::to_value(project).unwrap();
+        value["groups"][&root]["placement"]
+            .as_object_mut()
+            .unwrap()
+            .remove("rotation");
+
+        let loaded: Project = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            loaded.groups[&loaded.root_group_id()].placement.rotation,
+            GridRotation::IDENTITY
+        );
+        assert!(loaded.validate().is_ok());
     }
 }

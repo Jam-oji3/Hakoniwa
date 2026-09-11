@@ -260,6 +260,7 @@ mod tests {
                 Placement {
                     translation: GridPosition::new(5, -2, 1),
                     orientation: OrthogonalOrientation::Yz,
+                    ..Placement::default()
                 },
             )
             .unwrap();
