@@ -3081,13 +3081,7 @@ fn render_voxels(
         );
     }
     faces.sort_by(|a, b| a.depth.total_cmp(&b.depth));
-    for face in &faces {
-        painter.add(egui::Shape::convex_polygon(
-            face.points.clone(),
-            face.color,
-            egui::Stroke::NONE,
-        ));
-    }
+    paint_faces_as_one_mesh(painter, &faces);
     let selected_faces = faces
         .iter()
         .filter(|face| object_is_selected(project, face.object, options.selected))
@@ -3207,6 +3201,32 @@ fn pick_rendered_object(faces: &[RenderFace], pointer: egui::Pos2) -> Option<Obj
         .rev()
         .find(|face| point_in_convex_polygon(pointer, &face.points))
         .map(|face| face.object)
+}
+
+fn paint_faces_as_one_mesh(painter: &egui::Painter, faces: &[RenderFace]) {
+    let mut mesh = egui::Mesh::default();
+    append_faces_to_mesh(&mut mesh, faces);
+    if !mesh.is_empty() {
+        painter.add(egui::Shape::mesh(mesh));
+    }
+}
+
+fn append_faces_to_mesh(mesh: &mut egui::Mesh, faces: &[RenderFace]) {
+    for face in faces {
+        let first_vertex = mesh.vertices.len() as u32;
+        for point in &face.points {
+            mesh.vertices
+                .push(egui::epaint::Vertex::untextured(*point, face.color));
+        }
+        mesh.indices.extend_from_slice(&[
+            first_vertex,
+            first_vertex + 1,
+            first_vertex + 2,
+            first_vertex,
+            first_vertex + 2,
+            first_vertex + 3,
+        ]);
+    }
 }
 
 fn point_in_convex_polygon(point: egui::Pos2, polygon: &[egui::Pos2]) -> bool {
@@ -3683,6 +3703,41 @@ mod presentation_tests {
         );
 
         assert_eq!(faces.len(), 2);
+    }
+
+    #[test]
+    fn batched_face_mesh_uses_two_triangles_per_face() {
+        let faces = vec![
+            RenderFace {
+                object: ObjectRef::Piece(1),
+                depth: 0.0,
+                points: vec![
+                    egui::pos2(0.0, 0.0),
+                    egui::pos2(10.0, 0.0),
+                    egui::pos2(10.0, 10.0),
+                    egui::pos2(0.0, 10.0),
+                ],
+                color: egui::Color32::RED,
+            },
+            RenderFace {
+                object: ObjectRef::Piece(1),
+                depth: 0.0,
+                points: vec![
+                    egui::pos2(10.0, 0.0),
+                    egui::pos2(20.0, 0.0),
+                    egui::pos2(20.0, 10.0),
+                    egui::pos2(10.0, 10.0),
+                ],
+                color: egui::Color32::RED,
+            },
+        ];
+        let mut mesh = egui::Mesh::default();
+
+        append_faces_to_mesh(&mut mesh, &faces);
+
+        assert!(mesh.is_valid());
+        assert_eq!(mesh.vertices.len(), 8);
+        assert_eq!(mesh.indices.len(), 12);
     }
 
     #[test]
