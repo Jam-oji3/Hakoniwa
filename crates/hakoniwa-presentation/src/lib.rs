@@ -1,7 +1,14 @@
+mod editor_2d;
+
 use eframe::egui;
 use glam::{Quat, Vec3};
-use hakoniwa_domain::{Bead, Color, GridPosition, Piece, Plane, Project};
+use hakoniwa_application::{Command, Editor};
+use hakoniwa_domain::{
+    Bead, Color, GridPosition, ObjectId, ObjectRef, Piece, Plane, Project, VoxelObjectRef,
+};
 use std::{collections::BTreeSet, sync::Arc};
+
+use editor_2d::{GridPoint2d, PlateLayout, Viewport2d, project_position, unproject_position};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkspacePane {
@@ -17,8 +24,9 @@ struct WorkspacePaneIds {
     assembly_view: egui_tiles::TileId,
 }
 pub struct HakoniwaApp {
-    project: Project,
-    selected: Option<u64>,
+    editor: Editor,
+    selected: Option<ObjectRef>,
+    piece_editor: PieceEditorState,
     status: String,
     zoom: f32,
     orientation: Quat,
@@ -50,8 +58,9 @@ impl HakoniwaApp {
         ctx.set_visuals(egui::Visuals::light());
         let (workspace, pane_ids) = create_workspace_tree();
         Self {
-            project: hammer_project(),
+            editor: Editor::new(hammer_project()),
             selected: None,
+            piece_editor: PieceEditorState::default(),
             status: "ハンマーのMVPサンプルを読み込みました".into(),
             zoom: 1.0,
             orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
@@ -105,9 +114,34 @@ impl eframe::App for HakoniwaApp {
             .rect_filled(ui.max_rect(), 0.0, egui::Color32::WHITE);
         ui.horizontal(|ui| {
             if ui.button("ハンマーを新規作成").clicked() {
-                self.project = hammer_project();
+                self.editor = Editor::new(hammer_project());
                 self.selected = None;
+                self.piece_editor.reset();
                 self.status = "ハンマーを作成しました".into();
+            }
+            let undo_requested = ui
+                .add_enabled(self.editor.can_undo(), egui::Button::new("Undo"))
+                .clicked()
+                || ui.ctx().input_mut(|input| {
+                    input.consume_shortcut(&egui::KeyboardShortcut::new(
+                        egui::Modifiers::CTRL,
+                        egui::Key::Z,
+                    ))
+                });
+            let redo_requested = ui
+                .add_enabled(self.editor.can_redo(), egui::Button::new("Redo"))
+                .clicked()
+                || ui.ctx().input_mut(|input| {
+                    input.consume_shortcut(&egui::KeyboardShortcut::new(
+                        egui::Modifiers::CTRL,
+                        egui::Key::Y,
+                    ))
+                });
+            if undo_requested && self.editor.undo() {
+                self.status = "操作を元に戻しました".into();
+            }
+            if redo_requested && self.editor.redo() {
+                self.status = "操作をやり直しました".into();
             }
             ui.label(&self.status);
             ui.separator();
@@ -133,28 +167,30 @@ impl eframe::App for HakoniwaApp {
         });
         ui.separator();
 
-        let Self {
-            project,
-            selected,
-            zoom,
-            orientation,
-            pan,
-            perspective,
-            workspace,
-            ..
-        } = self;
-        let mut behavior = WorkspaceBehavior {
-            project,
-            selected,
-            zoom,
-            orientation,
-            pan,
-            perspective,
-            close_requested: None,
+        let commands = {
+            let mut behavior = WorkspaceBehavior {
+                project: self.editor.project(),
+                selected: &mut self.selected,
+                piece_editor: &mut self.piece_editor,
+                zoom: &mut self.zoom,
+                orientation: &mut self.orientation,
+                pan: &mut self.pan,
+                perspective: &mut self.perspective,
+                close_requested: None,
+                commands: Vec::new(),
+            };
+            self.workspace.ui(&mut behavior, ui);
+            if let Some(tile_id) = behavior.close_requested {
+                self.workspace.tiles.set_visible(tile_id, false);
+            }
+            behavior.commands
         };
-        workspace.ui(&mut behavior, ui);
-        if let Some(tile_id) = behavior.close_requested {
-            workspace.tiles.set_visible(tile_id, false);
+
+        for command in commands {
+            match self.editor.execute(command) {
+                Ok(_) => self.status = "編集しました".into(),
+                Err(error) => self.status = format!("編集できません: {error:?}"),
+            }
         }
     }
 }
@@ -178,12 +214,14 @@ fn create_workspace_tree() -> (egui_tiles::Tree<WorkspacePane>, WorkspacePaneIds
 
 struct WorkspaceBehavior<'a> {
     project: &'a Project,
-    selected: &'a mut Option<u64>,
+    selected: &'a mut Option<ObjectRef>,
+    piece_editor: &'a mut PieceEditorState,
     zoom: &'a mut f32,
     orientation: &'a mut Quat,
     pan: &'a mut egui::Vec2,
     perspective: &'a mut bool,
     close_requested: Option<egui_tiles::TileId>,
+    commands: Vec<Command>,
 }
 
 impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
@@ -201,7 +239,9 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
                 ui,
                 self.project
                     .pieces
-                    .get(&(*self.selected).unwrap_or_default()),
+                    .get(&selected_piece_id(*self.selected).unwrap_or_default()),
+                self.piece_editor,
+                &mut self.commands,
             ),
             WorkspacePane::AssemblyView => draw_preview(
                 ui,
@@ -281,53 +321,334 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
     }
 }
 
-fn draw_parts_tree(ui: &mut egui::Ui, project: &Project, selected: &mut Option<u64>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PieceTool {
+    Pencil,
+    Eraser,
+}
+
+struct PieceEditorState {
+    piece_id: Option<ObjectId>,
+    layout: PlateLayout,
+    viewport: Option<Viewport2d>,
+    tool: PieceTool,
+    color: Color,
+    last_dragged_cell: Option<GridPoint2d>,
+}
+
+impl Default for PieceEditorState {
+    fn default() -> Self {
+        Self {
+            piece_id: None,
+            layout: PlateLayout::empty_piece(),
+            viewport: None,
+            tool: PieceTool::Pencil,
+            color: Color::RED,
+            last_dragged_cell: None,
+        }
+    }
+}
+
+impl PieceEditorState {
+    fn reset(&mut self) {
+        self.piece_id = None;
+        self.layout = PlateLayout::empty_piece();
+        self.viewport = None;
+        self.last_dragged_cell = None;
+    }
+
+    fn ensure_piece(&mut self, piece: &Piece, size: egui::Vec2) {
+        if self.piece_id == Some(piece.id) && self.viewport.is_some() {
+            return;
+        }
+        self.piece_id = Some(piece.id);
+        self.layout = PlateLayout::for_piece(piece);
+        self.viewport = Some(Viewport2d::for_layout(
+            self.layout,
+            size.x.max(1.0),
+            size.y.max(1.0),
+        ));
+        self.last_dragged_cell = None;
+    }
+}
+
+fn selected_piece_id(selected: Option<ObjectRef>) -> Option<ObjectId> {
+    match selected {
+        Some(ObjectRef::Piece(id)) => Some(id),
+        _ => None,
+    }
+}
+
+fn draw_parts_tree(ui: &mut egui::Ui, project: &Project, selected: &mut Option<ObjectRef>) {
     for (id, piece) in &project.pieces {
         if ui
             .selectable_label(
-                *selected == Some(*id),
+                *selected == Some(ObjectRef::Piece(*id)),
                 format!("▦ {} ({} beads)", piece.name, piece.beads.len()),
             )
             .clicked()
         {
-            *selected = Some(*id);
+            *selected = Some(ObjectRef::Piece(*id));
         }
     }
     ui.separator();
     ui.label(format!("総ビーズ数: {}", project.inventory().total));
 }
-fn draw_editor(ui: &mut egui::Ui, piece: Option<&Piece>) {
+fn draw_editor(
+    ui: &mut egui::Ui,
+    piece: Option<&Piece>,
+    state: &mut PieceEditorState,
+    commands: &mut Vec<Command>,
+) {
     let Some(piece) = piece else {
+        state.reset();
         ui.label("ツリーからPieceを選択してください");
         return;
     };
-    ui.label(format!("{} · {:?}", piece.name, piece.plane));
-    let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
-    let painter = ui.painter();
+
+    state.ensure_piece(piece, ui.available_size());
+    ui.horizontal_wrapped(|ui| {
+        ui.label(format!("{} · {:?}", piece.name, piece.plane));
+        ui.separator();
+        ui.selectable_value(&mut state.tool, PieceTool::Pencil, "ペン");
+        ui.selectable_value(&mut state.tool, PieceTool::Eraser, "消しゴム");
+        ui.separator();
+        for (name, color) in editor_colors() {
+            let fill = egui::Color32::from_rgb(color.0, color.1, color.2);
+            if ui
+                .add(
+                    egui::Button::new(name)
+                        .fill(fill)
+                        .selected(state.color == color),
+                )
+                .clicked()
+            {
+                state.color = color;
+                state.tool = PieceTool::Pencil;
+            }
+        }
+        ui.separator();
+        ui.label(format!(
+            "{}×{} plates · {}×{} cells",
+            state.layout.columns,
+            state.layout.rows,
+            state.layout.columns * 29,
+            state.layout.rows * 29
+        ));
+    });
+    ui.label("左ドラッグ: 編集 / 中ホイールドラッグ: 移動 / ホイール: ズーム");
+
+    let available = ui.available_size();
+    let (rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
+    let Some(viewport) = state.viewport.as_mut() else {
+        return;
+    };
+    let screen_center = (rect.center().x, rect.center().y);
+
+    if response.hovered() {
+        ui.input(|input| {
+            if input.pointer.button_down(egui::PointerButton::Middle) {
+                let delta = input.pointer.delta();
+                viewport.pan_pixels(delta.x, delta.y);
+            }
+            if input.smooth_scroll_delta.y != 0.0
+                && let Some(pointer) = input.pointer.hover_pos()
+            {
+                let factor = (input.smooth_scroll_delta.y * 0.0015).exp();
+                viewport.zoom_at(factor, (pointer.x, pointer.y), screen_center);
+            }
+        });
+    }
+
+    let painter = ui.painter().with_clip_rect(rect);
+    draw_piece_grid(&painter, rect, state.layout, *viewport);
+    draw_piece_beads(&painter, rect, piece, *viewport);
+
+    let pointer_cell = response
+        .hover_pos()
+        .map(|pointer| viewport.screen_to_cell((pointer.x, pointer.y), screen_center));
+    if let Some(cell) = pointer_cell {
+        draw_cell_highlight(&painter, rect, cell, *viewport);
+    }
+
+    let primary_down = ui.input(|input| input.pointer.primary_down());
+    if !primary_down {
+        state.last_dragged_cell = None;
+    } else if response.hovered()
+        && pointer_cell.is_some()
+        && pointer_cell != state.last_dragged_cell
+    {
+        let cell = pointer_cell.expect("pointer cell was checked");
+        state.last_dragged_cell = Some(cell);
+        let position = unproject_position(piece.plane, cell);
+        let existing = piece.beads.get(&position).copied();
+        let target = VoxelObjectRef::Piece(piece.id);
+        match (state.tool, existing) {
+            (PieceTool::Pencil, None) => {
+                state.layout.expand_to_include(cell);
+                commands.push(Command::AddBead {
+                    target,
+                    bead: Bead {
+                        position,
+                        color: state.color,
+                    },
+                });
+            }
+            (PieceTool::Pencil, Some(color)) if color != state.color => {
+                commands.push(Command::RecolorBead {
+                    target,
+                    position,
+                    color: state.color,
+                });
+            }
+            (PieceTool::Eraser, Some(_)) => {
+                commands.push(Command::RemoveBead { target, position });
+            }
+            _ => {}
+        }
+    }
+}
+
+fn editor_colors() -> [(&'static str, Color); 7] {
+    [
+        ("赤", Color::RED),
+        ("茶", Color::BROWN),
+        ("黄", Color(242, 196, 56)),
+        ("緑", Color(60, 160, 90)),
+        ("青", Color(55, 110, 210)),
+        ("黒", Color(35, 35, 35)),
+        ("白", Color(245, 245, 245)),
+    ]
+}
+
+fn draw_piece_grid(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    layout: PlateLayout,
+    viewport: Viewport2d,
+) {
     painter.rect_filled(rect, 0.0, egui::Color32::from_gray(250));
-    for i in 0..11 {
-        let x = rect.left() + i as f32 * 30.0;
-        let y = rect.top() + i as f32 * 30.0;
+    let center = (rect.center().x, rect.center().y);
+    let top_left = viewport.screen_to_grid((rect.left(), rect.top()), center);
+    let bottom_right = viewport.screen_to_grid((rect.right(), rect.bottom()), center);
+    let visible_min_u = top_left.0.min(bottom_right.0).floor() as i32 - 1;
+    let visible_max_u = top_left.0.max(bottom_right.0).ceil() as i32 + 1;
+    let visible_min_v = top_left.1.min(bottom_right.1).floor() as i32 - 1;
+    let visible_max_v = top_left.1.max(bottom_right.1).ceil() as i32 + 1;
+
+    let plate_min = viewport.grid_to_screen(
+        (layout.min_u as f32 - 0.5, layout.max_v() as f32 + 0.5),
+        center,
+    );
+    let plate_max = viewport.grid_to_screen(
+        (layout.max_u() as f32 + 0.5, layout.min_v as f32 - 0.5),
+        center,
+    );
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(plate_min.0, plate_min.1),
+            egui::pos2(plate_max.0, plate_max.1),
+        ),
+        0.0,
+        egui::Color32::WHITE,
+    );
+
+    let auxiliary_stroke = egui::Stroke::new(0.5, egui::Color32::from_gray(232));
+    if viewport.pixels_per_cell >= 5.0 {
+        for u in visible_min_u..=visible_max_u {
+            let x = viewport.grid_to_screen((u as f32 - 0.5, 0.0), center).0;
+            painter.line_segment(
+                [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                auxiliary_stroke,
+            );
+        }
+        for v in visible_min_v..=visible_max_v {
+            let y = viewport.grid_to_screen((0.0, v as f32 - 0.5), center).1;
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                auxiliary_stroke,
+            );
+        }
+    }
+
+    let cell_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(195));
+    let active_min_u = layout.min_u.max(visible_min_u);
+    let active_max_u = layout.max_u().min(visible_max_u);
+    let active_min_v = layout.min_v.max(visible_min_v);
+    let active_max_v = layout.max_v().min(visible_max_v);
+    if active_min_u <= active_max_u {
+        for u in active_min_u..=active_max_u.saturating_add(1) {
+            let x = viewport.grid_to_screen((u as f32 - 0.5, 0.0), center).0;
+            painter.line_segment(
+                [egui::pos2(x, plate_min.1), egui::pos2(x, plate_max.1)],
+                cell_stroke,
+            );
+        }
+    }
+    if active_min_v <= active_max_v {
+        for v in active_min_v..=active_max_v.saturating_add(1) {
+            let y = viewport.grid_to_screen((0.0, v as f32 - 0.5), center).1;
+            painter.line_segment(
+                [egui::pos2(plate_min.0, y), egui::pos2(plate_max.0, y)],
+                cell_stroke,
+            );
+        }
+    }
+
+    let plate_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 115, 160));
+    for column in 0..=layout.columns {
+        let u = layout.min_u as f32 + column as f32 * 29.0 - 0.5;
+        let x = viewport.grid_to_screen((u, 0.0), center).0;
         painter.line_segment(
-            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(190)),
-        );
-        painter.line_segment(
-            [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(1.0, egui::Color32::from_gray(190)),
+            [egui::pos2(x, plate_min.1), egui::pos2(x, plate_max.1)],
+            plate_stroke,
         );
     }
-    for (pos, color) in &piece.beads {
+    for row in 0..=layout.rows {
+        let v = layout.min_v as f32 + row as f32 * 29.0 - 0.5;
+        let y = viewport.grid_to_screen((0.0, v), center).1;
+        painter.line_segment(
+            [egui::pos2(plate_min.0, y), egui::pos2(plate_max.0, y)],
+            plate_stroke,
+        );
+    }
+}
+
+fn draw_piece_beads(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    piece: &Piece,
+    viewport: Viewport2d,
+) {
+    let center = (rect.center().x, rect.center().y);
+    for (position, color) in &piece.beads {
+        let point = project_position(piece.plane, *position);
+        let screen = viewport.grid_to_screen((point.u as f32, point.v as f32), center);
         painter.circle_filled(
-            egui::pos2(
-                rect.center().x + pos.x as f32 * 30.0,
-                rect.center().y - pos.y as f32 * 30.0,
-            ),
-            11.0,
+            egui::pos2(screen.0, screen.1),
+            (viewport.pixels_per_cell * 0.38).max(1.0),
             egui::Color32::from_rgb(color.0, color.1, color.2),
         );
     }
 }
+
+fn draw_cell_highlight(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    cell: GridPoint2d,
+    viewport: Viewport2d,
+) {
+    let center = (rect.center().x, rect.center().y);
+    let min = viewport.grid_to_screen((cell.u as f32 - 0.5, cell.v as f32 + 0.5), center);
+    let max = viewport.grid_to_screen((cell.u as f32 + 0.5, cell.v as f32 - 0.5), center);
+    painter.rect_stroke(
+        egui::Rect::from_min_max(egui::pos2(min.0, min.1), egui::pos2(max.0, max.1)),
+        0.0,
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(40, 105, 210)),
+        egui::StrokeKind::Inside,
+    );
+}
+
 fn draw_preview(
     ui: &mut egui::Ui,
     project: &Project,
