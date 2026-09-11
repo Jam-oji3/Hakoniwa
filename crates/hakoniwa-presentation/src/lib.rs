@@ -346,6 +346,7 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
             WorkspacePane::AssemblyView => draw_preview(
                 ui,
                 self.project,
+                self.selected,
                 self.zoom,
                 self.orientation,
                 self.pan,
@@ -1533,6 +1534,7 @@ const fn plane_label(plane: Plane) -> &'static str {
 fn draw_preview(
     ui: &mut egui::Ui,
     project: &Project,
+    selected: &mut Option<ObjectRef>,
     zoom: &mut f32,
     orientation: &mut Quat,
     pan: &mut egui::Vec2,
@@ -1548,7 +1550,8 @@ fn draw_preview(
         }
     });
     ui.label("中ホイールドラッグ: Turntable回転 / Shift+中ホイール: 移動 / ホイール: ズーム");
-    let (rect, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::drag());
+    let (rect, response) =
+        ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
     if response.hovered() {
         ui.input(|input| {
             if input.pointer.button_down(egui::PointerButton::Middle) {
@@ -1566,15 +1569,23 @@ fn draw_preview(
     }
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
-    render_voxels(
+    let faces = render_voxels(
         &painter,
         rect,
         project,
-        *orientation,
-        *zoom,
-        *pan,
-        *perspective,
+        RenderOptions {
+            selected: *selected,
+            orientation: *orientation,
+            zoom: *zoom,
+            pan: *pan,
+            perspective: *perspective,
+        },
     );
+    if response.clicked_by(egui::PointerButton::Primary)
+        && let Some(pointer) = response.interact_pointer_pos()
+    {
+        *selected = pick_rendered_object(&faces, pointer);
+    }
 }
 
 fn apply_turntable_drag(orientation: &mut Quat, delta: egui::Vec2) {
@@ -1615,31 +1626,71 @@ struct Camera {
 }
 
 struct RenderFace {
+    object: ObjectRef,
     depth: f32,
     points: Vec<egui::Pos2>,
     color: egui::Color32,
+}
+
+#[derive(Clone, Copy)]
+struct RenderOptions {
+    selected: Option<ObjectRef>,
+    orientation: Quat,
+    zoom: f32,
+    pan: egui::Vec2,
+    perspective: bool,
 }
 
 fn render_voxels(
     painter: &egui::Painter,
     rect: egui::Rect,
     project: &Project,
-    orientation: Quat,
-    zoom: f32,
-    pan: egui::Vec2,
-    perspective: bool,
-) {
-    let visible_pieces = project
+    options: RenderOptions,
+) -> Vec<RenderFace> {
+    let visible_objects = project
         .pieces
         .values()
         .filter(|piece| piece.visible && group_chain_is_visible(project, piece.parent_group_id))
+        .map(|piece| {
+            (
+                ObjectRef::Piece(piece.id),
+                piece.parent_group_id,
+                piece.placement,
+                &piece.beads,
+            )
+        })
+        .chain(
+            project
+                .shapes
+                .values()
+                .filter(|shape| {
+                    shape.visible && group_chain_is_visible(project, shape.parent_group_id)
+                })
+                .map(|shape| {
+                    (
+                        ObjectRef::Shape(shape.id),
+                        shape.parent_group_id,
+                        shape.placement,
+                        &shape.beads,
+                    )
+                }),
+        )
         .collect::<Vec<_>>();
-    let occupied = visible_pieces
+    let occupied = visible_objects
         .iter()
-        .flat_map(|piece| piece.beads.keys().copied())
+        .flat_map(|(_, parent_group_id, placement, beads)| {
+            beads.keys().map(|position| {
+                translated_world_position(
+                    project,
+                    *parent_group_id,
+                    placement.translation,
+                    *position,
+                )
+            })
+        })
         .collect::<BTreeSet<_>>();
     if occupied.is_empty() {
-        return;
+        return Vec::new();
     }
     let min = Vec3::new(
         occupied.iter().map(|p| p.x).min().unwrap() as f32,
@@ -1653,20 +1704,26 @@ fn render_voxels(
     );
     let span = (max - min + Vec3::ONE).max_element().max(1.0);
     let camera = Camera {
-        orientation,
+        orientation: options.orientation,
         target: (min + max) * 0.5,
-        pixels_per_unit: rect.width().min(rect.height()) * 0.65 / span * zoom,
-        pan,
-        perspective,
+        pixels_per_unit: rect.width().min(rect.height()) * 0.65 / span * options.zoom,
+        pan: options.pan,
+        perspective: options.perspective,
         focal_distance: span * 4.0,
     };
     let mut faces = Vec::new();
-    for piece in visible_pieces {
-        for (position, color) in &piece.beads {
+    for (object, parent_group_id, placement, beads) in visible_objects {
+        for (position, color) in beads {
             append_faces(
                 &mut faces,
                 rect.center(),
-                *position,
+                object,
+                translated_world_position(
+                    project,
+                    parent_group_id,
+                    placement.translation,
+                    *position,
+                ),
                 *color,
                 &occupied,
                 &camera,
@@ -1674,13 +1731,92 @@ fn render_voxels(
         }
     }
     faces.sort_by(|a, b| a.depth.total_cmp(&b.depth));
-    for face in faces {
+    for face in &faces {
         painter.add(egui::Shape::convex_polygon(
-            face.points,
+            face.points.clone(),
             face.color,
             egui::Stroke::NONE,
         ));
     }
+    for face in &faces {
+        if object_is_selected(project, face.object, options.selected) {
+            painter.add(egui::Shape::closed_line(
+                face.points.clone(),
+                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 132, 18)),
+            ));
+        }
+    }
+    faces
+}
+
+fn translated_world_position(
+    project: &Project,
+    mut parent_group_id: ObjectId,
+    object_translation: GridPosition,
+    position: GridPosition,
+) -> GridPosition {
+    let mut world = add_grid_positions(position, object_translation);
+    loop {
+        let Some(group) = project.groups.get(&parent_group_id) else {
+            return world;
+        };
+        world = add_grid_positions(world, group.placement.translation);
+        let Some(parent) = group.parent_group_id else {
+            return world;
+        };
+        parent_group_id = parent;
+    }
+}
+
+const fn add_grid_positions(left: GridPosition, right: GridPosition) -> GridPosition {
+    GridPosition::new(left.x + right.x, left.y + right.y, left.z + right.z)
+}
+
+fn object_is_selected(project: &Project, object: ObjectRef, selected: Option<ObjectRef>) -> bool {
+    match selected {
+        Some(selected) if selected == object => true,
+        Some(ObjectRef::Group(group_id)) => {
+            let mut parent = object_parent_group(project, object);
+            while let Some(parent_id) = parent {
+                if parent_id == group_id {
+                    return true;
+                }
+                parent = project
+                    .groups
+                    .get(&parent_id)
+                    .and_then(|group| group.parent_group_id);
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+fn pick_rendered_object(faces: &[RenderFace], pointer: egui::Pos2) -> Option<ObjectRef> {
+    faces
+        .iter()
+        .rev()
+        .find(|face| point_in_convex_polygon(pointer, &face.points))
+        .map(|face| face.object)
+}
+
+fn point_in_convex_polygon(point: egui::Pos2, polygon: &[egui::Pos2]) -> bool {
+    let mut sign = 0.0_f32;
+    for index in 0..polygon.len() {
+        let start = polygon[index];
+        let end = polygon[(index + 1) % polygon.len()];
+        let cross =
+            (end.x - start.x) * (point.y - start.y) - (end.y - start.y) * (point.x - start.x);
+        if cross.abs() <= f32::EPSILON {
+            continue;
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if sign != cross.signum() {
+            return false;
+        }
+    }
+    true
 }
 
 fn group_chain_is_visible(project: &Project, mut group_id: ObjectId) -> bool {
@@ -1701,6 +1837,7 @@ fn group_chain_is_visible(project: &Project, mut group_id: ObjectId) -> bool {
 fn append_faces(
     output: &mut Vec<RenderFace>,
     center: egui::Pos2,
+    object: ObjectRef,
     position: GridPosition,
     color: Color,
     occupied: &BTreeSet<GridPosition>,
@@ -1798,6 +1935,7 @@ fn append_faces(
                     .abs())
         .clamp(0.35, 1.0);
         output.push(RenderFace {
+            object,
             depth: depth / 4.0,
             points,
             color: egui::Color32::from_rgb(
@@ -1876,6 +2014,85 @@ mod presentation_tests {
             &project,
             project.pieces[&piece].parent_group_id
         ));
+    }
+
+    #[test]
+    fn group_selection_includes_descendant_objects() {
+        let mut project = Project::new("selection");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "group").unwrap();
+        let nested = project.create_group(group, "nested").unwrap();
+        let inside = project
+            .create_piece(nested, "inside", Plane::Xy { z: 0 })
+            .unwrap();
+        let outside = project
+            .create_piece(root, "outside", Plane::Xy { z: 0 })
+            .unwrap();
+
+        assert!(object_is_selected(
+            &project,
+            ObjectRef::Piece(inside),
+            Some(ObjectRef::Group(group))
+        ));
+        assert!(!object_is_selected(
+            &project,
+            ObjectRef::Piece(outside),
+            Some(ObjectRef::Group(group))
+        ));
+    }
+
+    #[test]
+    fn picking_uses_the_frontmost_face_containing_the_pointer() {
+        let square = vec![
+            egui::pos2(0.0, 0.0),
+            egui::pos2(10.0, 0.0),
+            egui::pos2(10.0, 10.0),
+            egui::pos2(0.0, 10.0),
+        ];
+        let faces = vec![
+            RenderFace {
+                object: ObjectRef::Piece(1),
+                depth: 0.0,
+                points: square.clone(),
+                color: egui::Color32::WHITE,
+            },
+            RenderFace {
+                object: ObjectRef::Piece(2),
+                depth: 1.0,
+                points: square,
+                color: egui::Color32::WHITE,
+            },
+        ];
+
+        assert_eq!(
+            pick_rendered_object(&faces, egui::pos2(5.0, 5.0)),
+            Some(ObjectRef::Piece(2))
+        );
+        assert_eq!(pick_rendered_object(&faces, egui::pos2(20.0, 20.0)), None);
+    }
+
+    #[test]
+    fn object_and_group_translations_are_composed_for_rendering() {
+        let mut project = Project::new("placement");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "group").unwrap();
+        project.groups.get_mut(&root).unwrap().placement.translation = GridPosition::new(1, 0, 0);
+        project
+            .groups
+            .get_mut(&group)
+            .unwrap()
+            .placement
+            .translation = GridPosition::new(0, 2, 0);
+
+        assert_eq!(
+            translated_world_position(
+                &project,
+                group,
+                GridPosition::new(0, 0, 3),
+                GridPosition::new(4, 5, 6)
+            ),
+            GridPosition::new(5, 7, 9)
+        );
     }
 }
 
