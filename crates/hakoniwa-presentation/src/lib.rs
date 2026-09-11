@@ -518,6 +518,7 @@ struct TreeEditorState {
     dragged: Option<ObjectRef>,
     drop_target: Option<TreeDropTarget>,
     clipboard: Option<ObjectClipboard>,
+    keyboard_focus: Option<ObjectRef>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -820,6 +821,10 @@ fn object_tree_label(project: &Project, object: ObjectRef) -> Option<String> {
     }
 }
 
+fn tree_row_id(object: ObjectRef) -> egui::Id {
+    egui::Id::new("parts-tree-row").with((object_kind_id(object), object.id()))
+}
+
 fn handle_tree_shortcuts(
     ui: &egui::Ui,
     project: &Project,
@@ -827,7 +832,13 @@ fn handle_tree_shortcuts(
     state: &mut TreeEditorState,
     commands: &mut Vec<PendingCommand>,
 ) {
-    if ui.ctx().egui_wants_keyboard_input() {
+    let Some(focused_object) = state.keyboard_focus else {
+        return;
+    };
+    if !ui
+        .ctx()
+        .memory(|memory| memory.has_focus(tree_row_id(focused_object)))
+    {
         return;
     }
     let copy_requested = ui.ctx().input_mut(|input| {
@@ -986,7 +997,7 @@ fn draw_object_row(
         rect.right_bottom(),
     );
     let main_rect = egui::Rect::from_min_max(rect.min, egui::pos2(eye_rect.left(), rect.bottom()));
-    let row_id = ui.id().with((object_kind_id(object), object.id()));
+    let row_id = tree_row_id(object);
 
     if context.state.renaming == Some(object) {
         let response = ui.put(
@@ -1016,11 +1027,7 @@ fn draw_object_row(
             context.state.renaming = None;
         }
     } else {
-        let response = ui.interact(
-            main_rect,
-            row_id.with("main"),
-            egui::Sense::click_and_drag(),
-        );
+        let response = ui.interact(main_rect, row_id, egui::Sense::click_and_drag());
         let hovered_drop_target = context.state.dragged.and_then(|dragged| {
             if !response.contains_pointer() {
                 return None;
@@ -1070,12 +1077,18 @@ fn draw_object_row(
 
         if response.clicked() {
             *context.selected = Some(object);
+            response.request_focus();
+            context.state.keyboard_focus = Some(object);
         }
         if response.secondary_clicked() {
             *context.selected = Some(object);
+            response.request_focus();
+            context.state.keyboard_focus = Some(object);
         }
         if response.drag_started() {
             *context.selected = Some(object);
+            response.request_focus();
+            context.state.keyboard_focus = Some(object);
             context.state.dragged = Some(object);
         }
         if let Some(target) = hovered_drop_target {
