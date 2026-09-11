@@ -32,6 +32,10 @@ pub enum Command {
     DeleteObject {
         object: ObjectRef,
     },
+    RenameObject {
+        object: ObjectRef,
+        name: String,
+    },
     AddBead {
         target: VoxelObjectRef,
         bead: Bead,
@@ -192,6 +196,10 @@ fn apply_command(project: &mut Project, command: Command) -> Result<CommandResul
         Command::DeleteObject { object } => {
             record_affected_pieces(project, object, &mut result.changes);
             project.delete_object(object)?;
+            record_object(&mut result.changes, object);
+        }
+        Command::RenameObject { object, name } => {
+            project.rename_object(object, name)?;
             record_object(&mut result.changes, object);
         }
         Command::AddBead { target, bead } => {
@@ -359,6 +367,22 @@ mod tests {
         assert_eq!(editor.project(), &before);
         assert!(editor.redo());
         assert_eq!(editor.project(), &after);
+    }
+
+    #[test]
+    fn rename_object_is_undoable() {
+        let (mut editor, piece) = piece_editor();
+        editor
+            .execute(Command::RenameObject {
+                object: ObjectRef::Piece(piece),
+                name: "renamed head".to_owned(),
+            })
+            .unwrap();
+        assert_eq!(editor.project().pieces[&piece].name, "renamed head");
+        assert!(editor.undo());
+        assert_eq!(editor.project().pieces[&piece].name, "head");
+        assert!(editor.redo());
+        assert_eq!(editor.project().pieces[&piece].name, "renamed head");
     }
 
     #[test]

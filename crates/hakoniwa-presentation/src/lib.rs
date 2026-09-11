@@ -232,10 +232,17 @@ where
         };
 
         for pending in commands {
+            let deletes_selection = matches!(
+                &pending.command,
+                Command::DeleteObject { object } if Some(*object) == self.selected
+            );
             match self.editor.execute(pending.command) {
                 Ok(result) => {
                     if pending.select_created && result.created_object.is_some() {
                         self.selected = result.created_object;
+                    } else if deletes_selection {
+                        self.selected = None;
+                        self.piece_editor.reset();
                     }
                     self.status = "編集しました".into();
                 }
@@ -427,6 +434,19 @@ impl NewPiecePlane {
 struct TreeEditorState {
     new_name: String,
     new_piece_plane: NewPiecePlane,
+    renaming: Option<ObjectRef>,
+    rename_buffer: String,
+    focus_rename: bool,
+    dragged: Option<ObjectRef>,
+    drop_target: Option<ObjectId>,
+}
+
+impl TreeEditorState {
+    fn start_rename(&mut self, object: ObjectRef, current_name: &str) {
+        self.renaming = Some(object);
+        self.rename_buffer = current_name.to_owned();
+        self.focus_rename = true;
+    }
 }
 
 struct PieceEditorState {
@@ -488,6 +508,10 @@ fn draw_parts_tree(
     state: &mut TreeEditorState,
     commands: &mut Vec<PendingCommand>,
 ) {
+    handle_tree_shortcuts(ui, project, *selected, state, commands);
+    if state.dragged.is_some() {
+        state.drop_target = None;
+    }
     ui.horizontal(|ui| {
         ui.label("名前");
         ui.text_edit_singleline(&mut state.new_name);
@@ -513,7 +537,7 @@ fn draw_parts_tree(
             });
             state.new_name.clear();
         }
-        if ui.button("＋Group").clicked() {
+        if ui.button("＋パーツ").clicked() {
             let name = non_empty_name(&state.new_name, "Group", project.groups.len());
             commands.push(PendingCommand {
                 command: Command::CreateGroup {
@@ -526,9 +550,58 @@ fn draw_parts_tree(
         }
     });
     ui.separator();
-    draw_group_tree(ui, project, project.root_group_id(), selected, commands);
+    draw_group_tree(
+        ui,
+        project,
+        project.root_group_id(),
+        selected,
+        state,
+        commands,
+    );
+    if ui.input(|input| input.pointer.any_released()) {
+        if let (Some(object), Some(target)) = (state.dragged, state.drop_target)
+            && can_reparent(project, object, target)
+        {
+            commands.push(PendingCommand {
+                command: Command::ReparentObject {
+                    object,
+                    new_parent_group_id: target,
+                },
+                select_created: false,
+            });
+        }
+        state.dragged = None;
+        state.drop_target = None;
+    }
     ui.separator();
     ui.label(format!("総ビーズ数: {}", project.inventory().total));
+}
+
+fn handle_tree_shortcuts(
+    ui: &egui::Ui,
+    project: &Project,
+    selected: Option<ObjectRef>,
+    state: &mut TreeEditorState,
+    commands: &mut Vec<PendingCommand>,
+) {
+    if ui.ctx().egui_wants_keyboard_input() {
+        return;
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::F2))
+        && let Some(object) = selected
+        && let Some(name) = object_name(project, object)
+    {
+        state.start_rename(object, name);
+    }
+    if ui.input(|input| input.key_pressed(egui::Key::Delete))
+        && let Some(object) = selected
+        && can_delete(project, object)
+    {
+        commands.push(PendingCommand {
+            command: Command::DeleteObject { object },
+            select_created: false,
+        });
+    }
 }
 
 fn non_empty_name(input: &str, prefix: &str, number: usize) -> String {
@@ -560,6 +633,7 @@ fn draw_group_tree(
     project: &Project,
     group_id: ObjectId,
     selected: &mut Option<ObjectRef>,
+    state: &mut TreeEditorState,
     commands: &mut Vec<PendingCommand>,
 ) {
     let Some(group) = project.groups.get(&group_id) else {
@@ -567,11 +641,15 @@ fn draw_group_tree(
     };
     draw_object_row(
         ui,
-        format!("▾ {}", group.name),
+        &group.name,
         ObjectRef::Group(group.id),
         group.visible,
-        selected,
-        commands,
+        &mut TreeRowContext {
+            project,
+            selected,
+            state,
+            commands,
+        },
     );
     ui.indent(("group-children", group.id), |ui| {
         for child in project
@@ -579,7 +657,7 @@ fn draw_group_tree(
             .values()
             .filter(|child| child.parent_group_id == Some(group.id))
         {
-            draw_group_tree(ui, project, child.id, selected, commands);
+            draw_group_tree(ui, project, child.id, selected, state, commands);
         }
         for shape in project
             .shapes
@@ -588,11 +666,15 @@ fn draw_group_tree(
         {
             draw_object_row(
                 ui,
-                format!("◆ {} ({} beads)", shape.name, shape.beads.len()),
+                &format!("{} ({} beads)", shape.name, shape.beads.len()),
                 ObjectRef::Shape(shape.id),
                 shape.visible,
-                selected,
-                commands,
+                &mut TreeRowContext {
+                    project,
+                    selected,
+                    state,
+                    commands,
+                },
             );
         }
         for piece in project
@@ -602,43 +684,364 @@ fn draw_group_tree(
         {
             draw_object_row(
                 ui,
-                format!("▦ {} ({} beads)", piece.name, piece.beads.len()),
+                &format!("{} ({} beads)", piece.name, piece.beads.len()),
                 ObjectRef::Piece(piece.id),
                 piece.visible,
-                selected,
-                commands,
+                &mut TreeRowContext {
+                    project,
+                    selected,
+                    state,
+                    commands,
+                },
             );
         }
     });
 }
 
+struct TreeRowContext<'a> {
+    project: &'a Project,
+    selected: &'a mut Option<ObjectRef>,
+    state: &'a mut TreeEditorState,
+    commands: &'a mut Vec<PendingCommand>,
+}
+
 fn draw_object_row(
     ui: &mut egui::Ui,
-    label: String,
+    label: &str,
     object: ObjectRef,
     visible: bool,
-    selected: &mut Option<ObjectRef>,
+    context: &mut TreeRowContext<'_>,
+) {
+    let row_height = 24.0;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_height),
+        egui::Sense::hover(),
+    );
+    let eye_rect = egui::Rect::from_min_max(
+        egui::pos2(rect.right() - row_height, rect.top()),
+        rect.right_bottom(),
+    );
+    let main_rect = egui::Rect::from_min_max(rect.min, egui::pos2(eye_rect.left(), rect.bottom()));
+    let row_id = ui.id().with((object_kind_id(object), object.id()));
+
+    if context.state.renaming == Some(object) {
+        let response = ui.put(
+            main_rect.shrink2(egui::vec2(2.0, 1.0)),
+            egui::TextEdit::singleline(&mut context.state.rename_buffer),
+        );
+        if context.state.focus_rename {
+            response.request_focus();
+            context.state.focus_rename = false;
+        }
+        let cancel = ui.input(|input| input.key_pressed(egui::Key::Escape));
+        let commit = ui.input(|input| input.key_pressed(egui::Key::Enter))
+            || (response.lost_focus() && !cancel);
+        if cancel {
+            context.state.renaming = None;
+        } else if commit {
+            let name = context.state.rename_buffer.trim();
+            if !name.is_empty() && object_name(context.project, object) != Some(name) {
+                context.commands.push(PendingCommand {
+                    command: Command::RenameObject {
+                        object,
+                        name: name.to_owned(),
+                    },
+                    select_created: false,
+                });
+            }
+            context.state.renaming = None;
+        }
+    } else {
+        let response = ui.interact(
+            main_rect,
+            row_id.with("main"),
+            egui::Sense::click_and_drag(),
+        );
+        let valid_drop_target = matches!(object, ObjectRef::Group(id) if context.state.dragged.is_some_and(|dragged| can_reparent(context.project, dragged, id)));
+        let background = if valid_drop_target && response.contains_pointer() {
+            egui::Color32::from_rgb(190, 215, 245)
+        } else if *context.selected == Some(object) {
+            egui::Color32::from_rgb(205, 225, 248)
+        } else if response.hovered() {
+            egui::Color32::from_gray(235)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(main_rect, 2.0, background);
+        draw_object_icon(ui.painter(), object, main_rect.left_center());
+        ui.painter().text(
+            egui::pos2(main_rect.left() + 23.0, main_rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            label,
+            egui::FontId::proportional(14.0),
+            ui.visuals().text_color(),
+        );
+
+        if response.clicked() {
+            *context.selected = Some(object);
+        }
+        if response.drag_started() {
+            *context.selected = Some(object);
+            context.state.dragged = Some(object);
+        }
+        if valid_drop_target
+            && response.contains_pointer()
+            && let ObjectRef::Group(id) = object
+        {
+            context.state.drop_target = Some(id);
+        }
+        response.context_menu(|ui| {
+            if ui.button("名前を変更    F2").clicked() {
+                if let Some(name) = object_name(context.project, object) {
+                    context.state.start_rename(object, name);
+                }
+                ui.close();
+            }
+            if let ObjectRef::Group(parent_group_id) = object {
+                ui.separator();
+                if ui.button("子パーツを追加").clicked() {
+                    queue_child_group(context.project, parent_group_id, context.commands);
+                    ui.close();
+                }
+                ui.menu_button("子Pieceを追加", |ui| {
+                    for plane in [NewPiecePlane::Xy, NewPiecePlane::Xz, NewPiecePlane::Yz] {
+                        if ui.button(plane.label()).clicked() {
+                            queue_child_piece(
+                                context.project,
+                                parent_group_id,
+                                plane,
+                                context.commands,
+                            );
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    can_delete(context.project, object),
+                    egui::Button::new("削除    Delete"),
+                )
+                .clicked()
+            {
+                context.commands.push(PendingCommand {
+                    command: Command::DeleteObject { object },
+                    select_created: false,
+                });
+                ui.close();
+            }
+        });
+    }
+
+    let eye_response = ui.interact(eye_rect, row_id.with("visibility"), egui::Sense::click());
+    if eye_response.clicked() {
+        context.commands.push(PendingCommand {
+            command: Command::SetVisibility {
+                object,
+                visible: !visible,
+            },
+            select_created: false,
+        });
+    }
+    if eye_response.hovered() {
+        ui.painter()
+            .rect_filled(eye_rect, 2.0, egui::Color32::from_gray(235));
+    }
+    draw_eye_icon(ui.painter(), eye_rect.center(), visible);
+}
+
+const fn object_kind_id(object: ObjectRef) -> u8 {
+    match object {
+        ObjectRef::Group(_) => 0,
+        ObjectRef::Shape(_) => 1,
+        ObjectRef::Piece(_) => 2,
+    }
+}
+
+fn object_name(project: &Project, object: ObjectRef) -> Option<&str> {
+    match object {
+        ObjectRef::Group(id) => project.groups.get(&id).map(|group| group.name.as_str()),
+        ObjectRef::Shape(id) => project.shapes.get(&id).map(|shape| shape.name.as_str()),
+        ObjectRef::Piece(id) => project.pieces.get(&id).map(|piece| piece.name.as_str()),
+    }
+}
+
+fn object_parent_group(project: &Project, object: ObjectRef) -> Option<ObjectId> {
+    match object {
+        ObjectRef::Group(id) => project.groups.get(&id)?.parent_group_id,
+        ObjectRef::Shape(id) => Some(project.shapes.get(&id)?.parent_group_id),
+        ObjectRef::Piece(id) => Some(project.pieces.get(&id)?.parent_group_id),
+    }
+}
+
+fn can_delete(project: &Project, object: ObjectRef) -> bool {
+    match object {
+        ObjectRef::Group(id) => {
+            id != project.root_group_id()
+                && !project
+                    .groups
+                    .values()
+                    .any(|group| group.parent_group_id == Some(id))
+                && !project
+                    .shapes
+                    .values()
+                    .any(|shape| shape.parent_group_id == id)
+                && !project
+                    .pieces
+                    .values()
+                    .any(|piece| piece.parent_group_id == id)
+        }
+        ObjectRef::Shape(id) => project.shapes.contains_key(&id),
+        ObjectRef::Piece(id) => project.pieces.contains_key(&id),
+    }
+}
+
+fn can_reparent(project: &Project, object: ObjectRef, target_group_id: ObjectId) -> bool {
+    if !project.groups.contains_key(&target_group_id)
+        || object_parent_group(project, object) == Some(target_group_id)
+    {
+        return false;
+    }
+    match object {
+        ObjectRef::Group(id) => {
+            if id == project.root_group_id() || id == target_group_id {
+                return false;
+            }
+            let mut ancestor = Some(target_group_id);
+            while let Some(group_id) = ancestor {
+                if group_id == id {
+                    return false;
+                }
+                ancestor = project
+                    .groups
+                    .get(&group_id)
+                    .and_then(|group| group.parent_group_id);
+            }
+            true
+        }
+        ObjectRef::Shape(id) => project.shapes.contains_key(&id),
+        ObjectRef::Piece(id) => project.pieces.contains_key(&id),
+    }
+}
+
+fn queue_child_group(
+    project: &Project,
+    parent_group_id: ObjectId,
     commands: &mut Vec<PendingCommand>,
 ) {
-    ui.horizontal(|ui| {
-        let mut requested_visibility = visible;
-        if ui.checkbox(&mut requested_visibility, "").changed() {
-            commands.push(PendingCommand {
-                command: Command::SetVisibility {
-                    object,
-                    visible: requested_visibility,
-                },
-                select_created: false,
-            });
-        }
-        if ui
-            .selectable_label(*selected == Some(object), label)
-            .clicked()
-        {
-            *selected = Some(object);
-        }
+    commands.push(PendingCommand {
+        command: Command::CreateGroup {
+            parent_group_id,
+            name: format!("Group {}", project.groups.len()),
+        },
+        select_created: true,
     });
 }
+
+fn queue_child_piece(
+    project: &Project,
+    parent_group_id: ObjectId,
+    plane: NewPiecePlane,
+    commands: &mut Vec<PendingCommand>,
+) {
+    commands.push(PendingCommand {
+        command: Command::CreatePiece {
+            parent_group_id,
+            name: format!("Piece {}", project.pieces.len() + 1),
+            plane: plane.plane(),
+        },
+        select_created: true,
+    });
+}
+
+fn draw_object_icon(painter: &egui::Painter, object: ObjectRef, left_center: egui::Pos2) {
+    let origin = egui::pos2(left_center.x + 3.0, left_center.y - 7.0);
+    match object {
+        ObjectRef::Group(_) => {
+            let color = egui::Color32::from_rgb(218, 164, 52);
+            painter.rect_filled(
+                egui::Rect::from_min_size(origin, egui::vec2(8.0, 4.0)),
+                1.0,
+                color,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(origin.x, origin.y + 3.0),
+                    egui::vec2(17.0, 12.0),
+                ),
+                2.0,
+                color,
+            );
+        }
+        ObjectRef::Shape(_) => {
+            let center = egui::pos2(origin.x + 8.0, origin.y + 7.0);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(center.x, center.y - 7.0),
+                    egui::pos2(center.x + 7.0, center.y),
+                    egui::pos2(center.x, center.y + 7.0),
+                    egui::pos2(center.x - 7.0, center.y),
+                ],
+                egui::Color32::from_rgb(118, 145, 190),
+                egui::Stroke::NONE,
+            ));
+        }
+        ObjectRef::Piece(_) => {
+            let color = egui::Color32::from_rgb(94, 143, 197);
+            for row in 0..3 {
+                for column in 0..3 {
+                    painter.rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(origin.x + column as f32 * 5.5, origin.y + row as f32 * 5.5),
+                            egui::vec2(4.0, 4.0),
+                        ),
+                        0.8,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn draw_eye_icon(painter: &egui::Painter, center: egui::Pos2, visible: bool) {
+    let color = if visible {
+        egui::Color32::from_gray(75)
+    } else {
+        egui::Color32::from_gray(175)
+    };
+    let left = egui::pos2(center.x - 8.0, center.y);
+    let right = egui::pos2(center.x + 8.0, center.y);
+    painter.line_segment(
+        [left, egui::pos2(center.x, center.y - 5.0)],
+        egui::Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [egui::pos2(center.x, center.y - 5.0), right],
+        egui::Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [right, egui::pos2(center.x, center.y + 5.0)],
+        egui::Stroke::new(1.5, color),
+    );
+    painter.line_segment(
+        [egui::pos2(center.x, center.y + 5.0), left],
+        egui::Stroke::new(1.5, color),
+    );
+    if visible {
+        painter.circle_filled(center, 2.5, color);
+    } else {
+        painter.line_segment(
+            [
+                egui::pos2(center.x - 7.0, center.y + 7.0),
+                egui::pos2(center.x + 7.0, center.y - 7.0),
+            ],
+            egui::Stroke::new(2.0, color),
+        );
+    }
+}
+
 fn draw_editor(
     ui: &mut egui::Ui,
     piece: Option<&Piece>,
@@ -1064,9 +1467,13 @@ fn render_voxels(
     pan: egui::Vec2,
     perspective: bool,
 ) {
-    let occupied = project
+    let visible_pieces = project
         .pieces
         .values()
+        .filter(|piece| piece.visible && group_chain_is_visible(project, piece.parent_group_id))
+        .collect::<Vec<_>>();
+    let occupied = visible_pieces
+        .iter()
         .flat_map(|piece| piece.beads.keys().copied())
         .collect::<BTreeSet<_>>();
     if occupied.is_empty() {
@@ -1092,7 +1499,7 @@ fn render_voxels(
         focal_distance: span * 4.0,
     };
     let mut faces = Vec::new();
-    for piece in project.pieces.values() {
+    for piece in visible_pieces {
         for (position, color) in &piece.beads {
             append_faces(
                 &mut faces,
@@ -1111,6 +1518,21 @@ fn render_voxels(
             face.color,
             egui::Stroke::NONE,
         ));
+    }
+}
+
+fn group_chain_is_visible(project: &Project, mut group_id: ObjectId) -> bool {
+    loop {
+        let Some(group) = project.groups.get(&group_id) else {
+            return false;
+        };
+        if !group.visible {
+            return false;
+        }
+        let Some(parent) = group.parent_group_id else {
+            return true;
+        };
+        group_id = parent;
     }
 }
 
@@ -1236,6 +1658,50 @@ fn project_point(center: egui::Pos2, point: Vec3, camera: &Camera) -> egui::Pos2
         center.y + camera.pan.y - point.y * camera.pixels_per_unit * perspective_scale,
     )
 }
+
+#[cfg(test)]
+mod presentation_tests {
+    use super::*;
+
+    #[test]
+    fn only_groups_are_valid_reparent_targets_and_cycles_are_rejected() {
+        let mut project = Project::new("tree");
+        let root = project.root_group_id();
+        let parent = project.create_group(root, "parent").unwrap();
+        let child = project.create_group(parent, "child").unwrap();
+        let piece = project
+            .create_piece(root, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+
+        assert!(can_reparent(&project, ObjectRef::Piece(piece), parent));
+        assert!(!can_reparent(&project, ObjectRef::Piece(piece), root));
+        assert!(!can_reparent(&project, ObjectRef::Group(parent), child));
+        assert!(!can_reparent(&project, ObjectRef::Group(root), child));
+    }
+
+    #[test]
+    fn hidden_ancestor_hides_descendant_pieces() {
+        let mut project = Project::new("visibility");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "part").unwrap();
+        let piece = project
+            .create_piece(group, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+
+        assert!(group_chain_is_visible(
+            &project,
+            project.pieces[&piece].parent_group_id
+        ));
+        project
+            .set_visibility(ObjectRef::Group(group), false)
+            .unwrap();
+        assert!(!group_chain_is_visible(
+            &project,
+            project.pieces[&piece].parent_group_id
+        ));
+    }
+}
+
 pub fn run<R>(repository: R) -> eframe::Result
 where
     R: ProjectRepository + 'static,

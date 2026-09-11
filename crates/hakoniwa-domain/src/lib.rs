@@ -409,6 +409,35 @@ impl Project {
         Ok(())
     }
 
+    pub fn rename_object(
+        &mut self,
+        object: ObjectRef,
+        name: impl Into<String>,
+    ) -> Result<(), DomainError> {
+        let name = name.into();
+        match object {
+            ObjectRef::Group(id) => {
+                self.groups
+                    .get_mut(&id)
+                    .ok_or(DomainError::GroupNotFound(id))?
+                    .name = name;
+            }
+            ObjectRef::Shape(id) => {
+                self.shapes
+                    .get_mut(&id)
+                    .ok_or(DomainError::ShapeNotFound(id))?
+                    .name = name;
+            }
+            ObjectRef::Piece(id) => {
+                self.pieces
+                    .get_mut(&id)
+                    .ok_or(DomainError::PieceNotFound(id))?
+                    .name = name;
+            }
+        }
+        Ok(())
+    }
+
     pub fn add_shape_bead(&mut self, shape_id: ObjectId, bead: Bead) -> Result<(), DomainError> {
         self.add_bead(VoxelObjectRef::Shape(shape_id), bead)
     }
