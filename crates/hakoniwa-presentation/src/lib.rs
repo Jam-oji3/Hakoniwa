@@ -591,6 +591,9 @@ fn draw_parts_tree(
         state,
         commands,
     );
+    if let Some(object) = state.dragged {
+        draw_tree_drag_ghost(ui, project, object);
+    }
     if ui.input(|input| input.pointer.any_released()) {
         if let (Some(object), Some(target)) = (state.dragged, state.drop_target)
             && can_reparent(project, object, target)
@@ -608,6 +611,54 @@ fn draw_parts_tree(
     }
     ui.separator();
     ui.label(format!("総ビーズ数: {}", project.inventory().total));
+}
+
+fn draw_tree_drag_ghost(ui: &egui::Ui, project: &Project, object: ObjectRef) {
+    let Some(pointer) = ui.input(|input| input.pointer.interact_pos()) else {
+        return;
+    };
+    let Some(label) = object_tree_label(project, object) else {
+        return;
+    };
+
+    let mut painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("parts-tree-drag-ghost"),
+    ));
+    painter.set_opacity(0.68);
+    let font = egui::FontId::proportional(14.0);
+    let text_color = ui.visuals().text_color();
+    let text_width = painter
+        .layout_no_wrap(label.clone(), font.clone(), text_color)
+        .size()
+        .x;
+    let rect = egui::Rect::from_min_size(
+        pointer + egui::vec2(12.0, 12.0),
+        egui::vec2((text_width + 35.0).max(88.0), 24.0),
+    );
+    painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(240, 244, 249));
+    draw_object_icon(&painter, object, rect.left_center());
+    painter.text(
+        egui::pos2(rect.left() + 23.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        text_color,
+    );
+}
+
+fn object_tree_label(project: &Project, object: ObjectRef) -> Option<String> {
+    match object {
+        ObjectRef::Group(id) => project.groups.get(&id).map(|group| group.name.clone()),
+        ObjectRef::Shape(id) => project
+            .shapes
+            .get(&id)
+            .map(|shape| format!("{} ({} beads)", shape.name, shape.beads.len())),
+        ObjectRef::Piece(id) => project
+            .pieces
+            .get(&id)
+            .map(|piece| format!("{} ({} beads)", piece.name, piece.beads.len())),
+    }
 }
 
 fn handle_tree_shortcuts(
