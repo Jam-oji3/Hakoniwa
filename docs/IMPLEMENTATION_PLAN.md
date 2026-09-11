@@ -22,6 +22,7 @@
 | M1 | `docs/DOMAIN_MODEL.md` | Entity、Value Object、不変条件、出力可能性の定義 |
 | M2 | `docs/COMMANDS.md` | Command一覧、失敗時の原子性、Undo/Redoの意味 |
 | M3 | `docs/IBCAD_FORMAT.md` | ZIP構成、`project.json`、形式バージョン、保存対象、読込エラー、互換性 |
+| M4 | `docs/TWO_D_EDITOR.md` | 平面座標、29×29プレート配置、領域拡張、パン・ズーム、表示状態 |
 | M7 | `docs/PALETTES.md` | 色の内部表現、パレットの出典・ライセンス、未登録色・カスタム色の扱い |
 | M8 | `docs/PDF_OUTPUT.md` | 出力対象、ページ分割、必須記載事項、組立図、有効/無効設定、出力拒否条件 |
 | M9 | `docs/STRUCTURAL_CHECKS.md` | 接合推定、警告種別、閾値、保証しない範囲、改善提案の形式 |
@@ -181,6 +182,8 @@ UIなしで、Piece-firstとShape-firstの中間状態を正しく表現・検�
 
 ### M4: 最小UIとPiece-firstの2D編集
 
+詳細仕様は [TWO_D_EDITOR.md](TWO_D_EDITOR.md) を参照する。
+
 #### 実装すること
 
 1. eframe/eguiの基本レイアウトを作る。
@@ -188,6 +191,10 @@ UIなしで、Piece-firstとShape-firstの中間状態を正しく表現・検�
 2. パーツツリーでGroup/Pieceを作成、選択、表示切替できるようにする。
 3. Piece用2Dグリッドを実装する。
    - ペン、消しゴム、色選択、範囲選択（最低限は単セル編集）
+   - 空のPieceでは原点中心の29×29プレートを1枚表示する
+   - 既存Pieceでは全Beadを覆う最小枚数の29×29プレートを表示する
+   - プレート外への配置時は、対象セルまで連結するプレートを29マス単位で追加する
+   - 中ホイールドラッグでパンし、ホイールでポインター基準ズームする
 4. ツリーのPiece選択から、そのPieceの2D編集画面を開く。
 5. UIイベントはすべてApplication Commandへ変換する。
 
@@ -199,6 +206,8 @@ UIなしで、Piece-firstとShape-firstの中間状態を正しく表現・検�
 - [ ] 編集後にUndo/RedoがUIから機能する。
 - [ ] 2D編集によりPieceの単一平面制約を破れない。
 - [ ] 29×29を超えるグリッドを閲覧・編集できる。
+- [ ] 既存Pieceの選択時に、全Beadを覆う最小枚数の29×29プレートが配置される。
+- [ ] プレート外への配置時に、既存領域とつながる29×29プレートが追加される。
 
 #### 完了条件
 
