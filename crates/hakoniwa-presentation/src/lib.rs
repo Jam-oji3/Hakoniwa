@@ -1885,12 +1885,9 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
     let hovered = match context.tool {
         TransformTool::Move => axes.into_iter().find(|axis| {
             context.pointer.is_some_and(|pointer| {
-                projected_axis_direction(context.rect.center(), camera, origin, *axis).is_some_and(
-                    |direction| {
-                        let end = center + direction * MOVE_GIZMO_LENGTH;
-                        distance_to_segment(pointer, center, end) <= 7.0
-                    },
-                )
+                let axis_vector =
+                    move_gizmo_axis_vector(context.rect.center(), camera, origin, *axis);
+                distance_to_segment(pointer, center, center + axis_vector) <= 7.0
             })
         }),
         TransformTool::Rotate => axes.into_iter().find(|axis| {
@@ -1911,23 +1908,22 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
         };
         match context.tool {
             TransformTool::Move => {
-                let Some(direction) =
-                    projected_axis_direction(context.rect.center(), camera, origin, axis)
-                else {
-                    continue;
-                };
-                let end = center + direction * MOVE_GIZMO_LENGTH;
+                let axis_vector =
+                    move_gizmo_axis_vector(context.rect.center(), camera, origin, axis);
+                let end = center + axis_vector;
                 context
                     .painter
                     .line_segment([center, end], egui::Stroke::new(width, color));
                 context.painter.circle_filled(end, 5.0, color);
-                context.painter.text(
-                    end + egui::vec2(7.0, 0.0),
-                    egui::Align2::LEFT_CENTER,
-                    axis_label(axis),
-                    egui::FontId::proportional(12.0),
-                    color,
-                );
+                if axis_vector.length() >= 18.0 {
+                    context.painter.text(
+                        end + egui::vec2(7.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        axis_label(axis),
+                        egui::FontId::proportional(12.0),
+                        color,
+                    );
+                }
             }
             TransformTool::Rotate => {
                 let ring = rotation_ring_points(center, camera, axis);
@@ -2212,6 +2208,19 @@ fn projected_axis_direction(
     let end = world_to_screen(viewport_center, origin + axis_vector(axis), camera);
     let direction = end - start;
     (direction.length_sq() > f32::EPSILON).then(|| direction.normalized())
+}
+
+fn move_gizmo_axis_vector(
+    viewport_center: egui::Pos2,
+    camera: &Camera,
+    origin: Vec3,
+    axis: GridAxis,
+) -> egui::Vec2 {
+    let camera_axis = camera.orientation * axis_vector(axis);
+    let foreshortening = camera_axis.x.hypot(camera_axis.y).clamp(0.0, 1.0);
+    projected_axis_direction(viewport_center, camera, origin, axis).unwrap_or(egui::Vec2::ZERO)
+        * MOVE_GIZMO_LENGTH
+        * foreshortening
 }
 
 fn rotation_ring_points(center: egui::Pos2, camera: &Camera, axis: GridAxis) -> Vec<egui::Pos2> {
@@ -3383,6 +3392,39 @@ mod presentation_tests {
         let after = world_to_screen(viewport_center, target, &editor.last_camera.unwrap());
         assert!(before.distance(after) < 0.001);
         assert_eq!(editor.camera_frame.unwrap().target, target);
+    }
+
+    #[test]
+    fn move_gizmo_axes_are_foreshortened_by_the_view_angle() {
+        let camera = Camera {
+            orientation: Quat::IDENTITY,
+            target: Vec3::ZERO,
+            pixels_per_unit: 20.0,
+            pan: egui::Vec2::ZERO,
+            perspective: false,
+            focal_distance: 20.0,
+        };
+        let center = egui::Pos2::ZERO;
+        let origin = Vec3::ZERO;
+
+        assert!(
+            (move_gizmo_axis_vector(center, &camera, origin, GridAxis::X).length()
+                - MOVE_GIZMO_LENGTH)
+                .abs()
+                < 0.001
+        );
+        assert!(move_gizmo_axis_vector(center, &camera, origin, GridAxis::Z).length() < 0.001);
+
+        let angled = Camera {
+            orientation: Quat::from_rotation_y(60.0_f32.to_radians()),
+            ..camera
+        };
+        assert!(
+            (move_gizmo_axis_vector(center, &angled, origin, GridAxis::X).length()
+                - MOVE_GIZMO_LENGTH * 0.5)
+                .abs()
+                < 0.01
+        );
     }
 }
 
