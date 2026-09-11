@@ -851,8 +851,11 @@ fn draw_object_row(
             egui::Sense::click_and_drag(),
         );
         let hovered_drop_target = context.state.dragged.and_then(|dragged| {
-            let pointer = response.hover_pos()?;
-            if pointer.y >= main_rect.bottom() - 7.0
+            if !response.contains_pointer() {
+                return None;
+            }
+            let pointer = ui.input(|input| input.pointer.hover_pos())?;
+            if pointer.y >= main_rect.top() + main_rect.height() * 0.6
                 && can_move_after(context.project, dragged, object)
             {
                 Some(TreeDropTarget::After(object))
@@ -864,7 +867,9 @@ fn draw_object_row(
                 None
             }
         });
-        let background = if matches!(hovered_drop_target, Some(TreeDropTarget::IntoGroup(_))) {
+        let background = if matches!(hovered_drop_target, Some(TreeDropTarget::After(_))) {
+            egui::Color32::from_rgb(225, 238, 252)
+        } else if matches!(hovered_drop_target, Some(TreeDropTarget::IntoGroup(_))) {
             egui::Color32::from_rgb(190, 215, 245)
         } else if *context.selected == Some(object) {
             egui::Color32::from_rgb(205, 225, 248)
@@ -885,10 +890,10 @@ fn draw_object_row(
         if matches!(hovered_drop_target, Some(TreeDropTarget::After(_))) {
             ui.painter().line_segment(
                 [
-                    egui::pos2(main_rect.left() + 2.0, main_rect.bottom() - 1.0),
-                    egui::pos2(main_rect.right() - 2.0, main_rect.bottom() - 1.0),
+                    egui::pos2(main_rect.left() + 2.0, main_rect.bottom() - 3.0),
+                    egui::pos2(main_rect.right() - 2.0, main_rect.bottom() - 3.0),
                 ],
-                egui::Stroke::new(3.0, egui::Color32::from_rgb(55, 120, 205)),
+                egui::Stroke::new(4.0, egui::Color32::from_rgb(35, 105, 205)),
             );
         }
 
