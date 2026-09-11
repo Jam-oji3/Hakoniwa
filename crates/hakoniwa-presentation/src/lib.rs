@@ -2,11 +2,11 @@ mod editor_2d;
 
 use eframe::egui;
 use glam::{Quat, Vec3};
-use hakoniwa_application::{Command, Editor};
+use hakoniwa_application::{Command, Editor, ProjectRepository};
 use hakoniwa_domain::{
     Bead, Color, GridPosition, ObjectId, ObjectRef, Piece, Plane, Project, VoxelObjectRef,
 };
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, fmt::Debug, path::PathBuf, sync::Arc};
 
 use editor_2d::{GridPoint2d, PlateLayout, Viewport2d, project_position, unproject_position};
 
@@ -30,8 +30,10 @@ struct PendingCommand {
     command: Command,
     select_created: bool,
 }
-pub struct HakoniwaApp {
+pub struct HakoniwaApp<R: ProjectRepository> {
     editor: Editor,
+    repository: R,
+    file_path: String,
     selected: Option<ObjectRef>,
     piece_editor: PieceEditorState,
     tree_editor: TreeEditorState,
@@ -43,8 +45,8 @@ pub struct HakoniwaApp {
     workspace: egui_tiles::Tree<WorkspacePane>,
     pane_ids: WorkspacePaneIds,
 }
-impl HakoniwaApp {
-    fn new(ctx: &egui::Context) -> Self {
+impl<R: ProjectRepository> HakoniwaApp<R> {
+    fn new(ctx: &egui::Context, repository: R) -> Self {
         let mut fonts = egui::FontDefinitions::default();
         fonts.font_data.insert(
             "noto-jp".into(),
@@ -67,6 +69,8 @@ impl HakoniwaApp {
         let (workspace, pane_ids) = create_workspace_tree();
         Self {
             editor: Editor::new(hammer_project()),
+            repository,
+            file_path: "hakoniwa.ibcad".into(),
             selected: None,
             piece_editor: PieceEditorState::default(),
             tree_editor: TreeEditorState::default(),
@@ -117,7 +121,11 @@ fn hammer_project() -> Project {
         .unwrap();
     project
 }
-impl eframe::App for HakoniwaApp {
+impl<R> eframe::App for HakoniwaApp<R>
+where
+    R: ProjectRepository + 'static,
+    R::Error: Debug,
+{
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         ui.painter()
             .rect_filled(ui.max_rect(), 0.0, egui::Color32::WHITE);
@@ -151,6 +159,32 @@ impl eframe::App for HakoniwaApp {
             }
             if redo_requested && self.editor.redo() {
                 self.status = "操作をやり直しました".into();
+            }
+            ui.separator();
+            ui.label("ファイル");
+            ui.add(egui::TextEdit::singleline(&mut self.file_path).desired_width(180.0));
+            if ui.button("保存").clicked() {
+                let path = ibcad_path(&self.file_path);
+                match self.repository.save(&path, self.editor.project()) {
+                    Ok(()) => {
+                        self.file_path = path.to_string_lossy().into_owned();
+                        self.status = format!("保存しました: {}", path.display());
+                    }
+                    Err(error) => self.status = format!("保存できません: {error:?}"),
+                }
+            }
+            if ui.button("読込").clicked() {
+                let path = ibcad_path(&self.file_path);
+                match self.repository.load(&path) {
+                    Ok(project) => {
+                        self.editor = Editor::new(project);
+                        self.selected = None;
+                        self.piece_editor.reset();
+                        self.file_path = path.to_string_lossy().into_owned();
+                        self.status = format!("読み込みました: {}", path.display());
+                    }
+                    Err(error) => self.status = format!("読み込めません: {error:?}"),
+                }
             }
             ui.label(&self.status);
             ui.separator();
@@ -209,6 +243,14 @@ impl eframe::App for HakoniwaApp {
             }
         }
     }
+}
+
+fn ibcad_path(input: &str) -> PathBuf {
+    let mut path = PathBuf::from(input.trim());
+    if path.extension().is_none() {
+        path.set_extension("ibcad");
+    }
+    path
 }
 
 fn create_workspace_tree() -> (egui_tiles::Tree<WorkspacePane>, WorkspacePaneIds) {
@@ -1194,10 +1236,14 @@ fn project_point(center: egui::Pos2, point: Vec3, camera: &Camera) -> egui::Pos2
         center.y + camera.pan.y - point.y * camera.pixels_per_unit * perspective_scale,
     )
 }
-pub fn run() -> eframe::Result {
+pub fn run<R>(repository: R) -> eframe::Result
+where
+    R: ProjectRepository + 'static,
+    R::Error: Debug,
+{
     eframe::run_native(
         "ハコニワ",
         eframe::NativeOptions::default(),
-        Box::new(|cc| Ok(Box::new(HakoniwaApp::new(&cc.egui_ctx)))),
+        Box::new(move |cc| Ok(Box::new(HakoniwaApp::new(&cc.egui_ctx, repository)))),
     )
 }

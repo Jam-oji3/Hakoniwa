@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 eframe = "0.36.2"
 hakoniwa-presentation = { version = "0.1.0", path = "../hakoniwa-presentation" }
+hakoniwa-infrastructure = { version = "0.1.0", path = "../hakoniwa-infrastructure" }
