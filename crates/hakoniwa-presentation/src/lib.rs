@@ -554,6 +554,7 @@ struct AssemblyEditorState {
     rotate_session: Option<RotateSession>,
     last_camera: Option<Camera>,
     camera_frame: Option<CameraFrame>,
+    hovered_object: Option<ObjectRef>,
 }
 
 impl AssemblyEditorState {
@@ -567,6 +568,7 @@ impl AssemblyEditorState {
         self.reset();
         self.last_camera = None;
         self.camera_frame = None;
+        self.hovered_object = None;
     }
 }
 
@@ -1679,9 +1681,16 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
         );
     }
     ui.label("ギズモ軸をクリック: +1マス / +90° · G→X/Y/Z: 軸固定 · G→Shift+軸: その軸を除外");
-    ui.label("中ホイールドラッグ: Turntable回転 / Shift+中ホイール: 移動 / ホイール: ズーム");
+    ui.label(
+        "中ホイールドラッグ: マウス下を中心にTurntable回転 / Shift+中ホイール: 移動 / ホイール: ズーム",
+    );
     let (rect, response) =
         ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
+    let orbit_started = response.drag_started_by(egui::PointerButton::Middle)
+        && !ui.input(|input| input.modifiers.shift);
+    if orbit_started && let Some(object) = context.editor.hovered_object.or(*context.selected) {
+        retarget_orbit_center(project, object, rect.center(), context.editor, context.pan);
+    }
     if response.hovered() {
         ui.input(|input| {
             if input.pointer.button_down(egui::PointerButton::Middle) {
@@ -1756,6 +1765,8 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
     if context.editor.camera_frame.is_none() {
         context.editor.camera_frame = rendered.camera_frame;
     }
+    context.editor.hovered_object =
+        pointer.and_then(|pointer| pick_rendered_object(&rendered.faces, pointer));
     if let (Some(session), Some(camera)) = (context.editor.move_session, rendered.camera.as_ref()) {
         draw_move_constraint_guide(&painter, rect, render_project, session, camera);
     }
@@ -2127,6 +2138,31 @@ const fn grid_to_vec3(position: GridPosition) -> Vec3 {
 
 fn world_to_screen(center: egui::Pos2, world: Vec3, camera: &Camera) -> egui::Pos2 {
     project_point(center, camera.orientation * (world - camera.target), camera)
+}
+
+fn retarget_orbit_center(
+    project: &Project,
+    object: ObjectRef,
+    viewport_center: egui::Pos2,
+    editor: &mut AssemblyEditorState,
+    pan: &mut egui::Vec2,
+) {
+    let (Some(target), Some(camera), Some(mut frame)) = (
+        object_gizmo_center(project, object),
+        editor.last_camera,
+        editor.camera_frame,
+    ) else {
+        return;
+    };
+    let target_screen = world_to_screen(viewport_center, target, &camera);
+    *pan = target_screen - viewport_center;
+    frame.target = target;
+    editor.camera_frame = Some(frame);
+    editor.last_camera = Some(Camera {
+        target,
+        pan: *pan,
+        ..camera
+    });
 }
 
 fn draw_move_constraint_guide(
@@ -3297,6 +3333,56 @@ mod presentation_tests {
 
         assert_eq!(session.quarter_turns, 1);
         assert_eq!(session.current_angle, std::f32::consts::FRAC_PI_2);
+    }
+
+    #[test]
+    fn changing_orbit_target_preserves_its_screen_position() {
+        let mut project = Project::new("orbit target");
+        let root = project.root_group_id();
+        let piece = project
+            .create_piece(root, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+        project
+            .add_bead(
+                VoxelObjectRef::Piece(piece),
+                Bead {
+                    position: GridPosition::new(4, 2, 0),
+                    color: Color::RED,
+                },
+            )
+            .unwrap();
+        let camera = Camera {
+            orientation: Quat::from_rotation_x(-0.4) * Quat::from_rotation_z(0.6),
+            target: Vec3::ZERO,
+            pixels_per_unit: 20.0,
+            pan: egui::vec2(12.0, -8.0),
+            perspective: true,
+            focal_distance: 20.0,
+        };
+        let mut editor = AssemblyEditorState {
+            last_camera: Some(camera),
+            camera_frame: Some(CameraFrame {
+                target: camera.target,
+                span: 8.0,
+            }),
+            ..AssemblyEditorState::default()
+        };
+        let viewport_center = egui::pos2(300.0, 200.0);
+        let target = object_gizmo_center(&project, ObjectRef::Piece(piece)).unwrap();
+        let before = world_to_screen(viewport_center, target, &camera);
+        let mut pan = camera.pan;
+
+        retarget_orbit_center(
+            &project,
+            ObjectRef::Piece(piece),
+            viewport_center,
+            &mut editor,
+            &mut pan,
+        );
+
+        let after = world_to_screen(viewport_center, target, &editor.last_camera.unwrap());
+        assert!(before.distance(after) < 0.001);
+        assert_eq!(editor.camera_frame.unwrap().target, target);
     }
 }
 
