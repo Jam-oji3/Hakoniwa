@@ -142,7 +142,7 @@ where
                 self.editor = Editor::new(hammer_project());
                 self.selected = None;
                 self.piece_editor.reset();
-                self.assembly_editor.reset();
+                self.assembly_editor.reset_camera();
                 self.status = "ハンマーを作成しました".into();
             }
             let undo_requested = ui
@@ -191,7 +191,7 @@ where
                         self.editor = Editor::new(project);
                         self.selected = None;
                         self.piece_editor.reset();
-                        self.assembly_editor.reset();
+                        self.assembly_editor.reset_camera();
                         self.file_path = path.to_string_lossy().into_owned();
                         self.status = format!("読み込みました: {}", path.display());
                     }
@@ -510,6 +510,12 @@ enum MoveConstraint {
     PlaneExcluding(GridAxis),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveSource {
+    Keyboard,
+    Gizmo,
+}
+
 #[derive(Clone, Copy)]
 struct MoveSession {
     object: ObjectRef,
@@ -518,6 +524,7 @@ struct MoveSession {
     start_pointer: egui::Pos2,
     constraint: MoveConstraint,
     camera: Option<Camera>,
+    source: MoveSource,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -533,12 +540,19 @@ struct AssemblyEditorState {
     tool: TransformTool,
     move_session: Option<MoveSession>,
     last_camera: Option<Camera>,
+    camera_frame: Option<CameraFrame>,
 }
 
 impl AssemblyEditorState {
     fn reset(&mut self) {
         self.shortcut = None;
         self.move_session = None;
+    }
+
+    fn reset_camera(&mut self) {
+        self.reset();
+        self.last_camera = None;
+        self.camera_frame = None;
     }
 }
 
@@ -1624,6 +1638,7 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
                 * Quat::from_rotation_z(45.0_f32.to_radians());
             *context.zoom = 1.0;
             *context.pan = egui::Vec2::ZERO;
+            context.editor.reset_camera();
         }
     });
     if let Some(session) = context.editor.move_session {
@@ -1686,13 +1701,27 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             zoom: *context.zoom,
             pan: *context.pan,
             perspective: *context.perspective,
+            camera_frame: context.editor.camera_frame,
         },
     );
     context.editor.last_camera = rendered.camera;
+    if context.editor.camera_frame.is_none() {
+        context.editor.camera_frame = rendered.camera_frame;
+    }
+    if let (Some(session), Some(camera)) = (context.editor.move_session, rendered.camera.as_ref()) {
+        draw_move_constraint_guide(&painter, rect, render_project, session, camera);
+    }
     let move_was_active = context.editor.move_session.is_some();
-    let confirm_move = move_was_active
-        && (response.clicked_by(egui::PointerButton::Primary)
-            || ui.input(|input| input.key_pressed(egui::Key::Enter)));
+    let confirm_move = context
+        .editor
+        .move_session
+        .is_some_and(|session| match session.source {
+            MoveSource::Keyboard => {
+                response.clicked_by(egui::PointerButton::Primary)
+                    || ui.input(|input| input.key_pressed(egui::Key::Enter))
+            }
+            MoveSource::Gizmo => response.drag_stopped_by(egui::PointerButton::Primary),
+        });
     let cancel_move = move_was_active && response.clicked_by(egui::PointerButton::Secondary);
     if confirm_move {
         let session = context
@@ -1724,6 +1753,8 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             tool: context.editor.tool,
             camera: rendered.camera.as_ref(),
             clicked: response.clicked_by(egui::PointerButton::Primary),
+            drag_started: response.drag_started_by(egui::PointerButton::Primary),
+            editor: context.editor,
             commands: context.commands,
         });
     if !move_was_active
@@ -1745,6 +1776,8 @@ struct GizmoContext<'a> {
     tool: TransformTool,
     camera: Option<&'a Camera>,
     clicked: bool,
+    drag_started: bool,
+    editor: &'a mut AssemblyEditorState,
     commands: &'a mut Vec<PendingCommand>,
 }
 
@@ -1801,6 +1834,28 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
     context
         .painter
         .circle_filled(center, 4.0, egui::Color32::from_rgb(245, 245, 245));
+
+    if context.tool == TransformTool::Move
+        && context.drag_started
+        && let Some(axis) = hovered
+        && let Some(start_placement) = placement_for_object(context.project, object)
+        && let Some(start_pointer) = context
+            .ui
+            .input(|input| input.pointer.press_origin())
+            .or(context.pointer)
+    {
+        context.editor.shortcut = Some(TransformShortcut::Move);
+        context.editor.move_session = Some(MoveSession {
+            object,
+            start_placement,
+            preview_placement: start_placement,
+            start_pointer,
+            constraint: MoveConstraint::Axis(axis),
+            camera: Some(*camera),
+            source: MoveSource::Gizmo,
+        });
+        return true;
+    }
 
     if !context.clicked || hovered.is_none() {
         return false;
@@ -1874,6 +1929,34 @@ fn object_world_origin(project: &Project, object: ObjectRef) -> Option<Vec3> {
 
 fn world_to_screen(center: egui::Pos2, world: Vec3, camera: &Camera) -> egui::Pos2 {
     project_point(center, camera.orientation * (world - camera.target), camera)
+}
+
+fn draw_move_constraint_guide(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    project: &Project,
+    session: MoveSession,
+    camera: &Camera,
+) {
+    let MoveConstraint::Axis(axis) = session.constraint else {
+        return;
+    };
+    let Some(origin) = object_world_origin(project, session.object) else {
+        return;
+    };
+    let projected = camera.orientation * axis_vector(axis);
+    let direction = egui::vec2(projected.x, -projected.y);
+    if direction.length_sq() <= f32::EPSILON {
+        return;
+    }
+    let center = world_to_screen(rect.center(), origin, camera);
+    let extent = rect.width() + rect.height();
+    let direction = direction.normalized() * extent;
+    painter.line_segment(
+        [center - direction, center + direction],
+        egui::Stroke::new(1.75, axis_color(axis)),
+    );
+    painter.circle_filled(center, 4.5, axis_color(axis));
 }
 
 fn projected_axis_direction(camera: &Camera, axis: GridAxis) -> egui::Vec2 {
@@ -1970,6 +2053,7 @@ fn handle_assembly_shortcuts(
             start_pointer,
             constraint: MoveConstraint::ViewPlane,
             camera: state.last_camera,
+            source: MoveSource::Keyboard,
         });
         return;
     }
@@ -2170,6 +2254,12 @@ struct Camera {
     focal_distance: f32,
 }
 
+#[derive(Clone, Copy)]
+struct CameraFrame {
+    target: Vec3,
+    span: f32,
+}
+
 struct RenderFace {
     object: ObjectRef,
     depth: f32,
@@ -2184,11 +2274,13 @@ struct RenderOptions {
     zoom: f32,
     pan: egui::Vec2,
     perspective: bool,
+    camera_frame: Option<CameraFrame>,
 }
 
 struct RenderOutput {
     faces: Vec<RenderFace>,
     camera: Option<Camera>,
+    camera_frame: Option<CameraFrame>,
 }
 
 fn render_voxels(
@@ -2238,6 +2330,7 @@ fn render_voxels(
         return RenderOutput {
             faces: Vec::new(),
             camera: None,
+            camera_frame: options.camera_frame,
         };
     }
     let min = Vec3::new(
@@ -2250,14 +2343,18 @@ fn render_voxels(
         occupied.iter().map(|p| p.y).max().unwrap() as f32,
         occupied.iter().map(|p| p.z).max().unwrap() as f32,
     );
-    let span = (max - min + Vec3::ONE).max_element().max(1.0);
+    let fitted_frame = CameraFrame {
+        target: (min + max) * 0.5,
+        span: (max - min + Vec3::ONE).max_element().max(1.0),
+    };
+    let frame = options.camera_frame.unwrap_or(fitted_frame);
     let camera = Camera {
         orientation: options.orientation,
-        target: (min + max) * 0.5,
-        pixels_per_unit: rect.width().min(rect.height()) * 0.65 / span * options.zoom,
+        target: frame.target,
+        pixels_per_unit: rect.width().min(rect.height()) * 0.65 / frame.span * options.zoom,
         pan: options.pan,
         perspective: options.perspective,
-        focal_distance: span * 4.0,
+        focal_distance: frame.span * 4.0,
     };
     let mut faces = Vec::new();
     for (object, parent_group_id, placement, beads) in visible_objects {
@@ -2294,6 +2391,7 @@ fn render_voxels(
     RenderOutput {
         faces,
         camera: Some(camera),
+        camera_frame: Some(frame),
     }
 }
 
