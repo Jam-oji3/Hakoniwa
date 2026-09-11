@@ -2872,7 +2872,29 @@ struct RenderFace {
     object: ObjectRef,
     depth: f32,
     points: Vec<egui::Pos2>,
+    world_points: [GridVertex; 4],
     color: egui::Color32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GridVertex {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl GridVertex {
+    const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    fn to_vec3(self) -> Vec3 {
+        Vec3::new(
+            self.x as f32 * 0.5,
+            self.y as f32 * 0.5,
+            self.z as f32 * 0.5,
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -3099,28 +3121,27 @@ fn render_voxels(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ScreenEdgeKey {
-    start: (i32, i32),
-    end: (i32, i32),
-}
-
 fn boundary_edges(faces: &[&RenderFace]) -> Vec<[egui::Pos2; 2]> {
     let face_edges = faces
         .iter()
         .flat_map(|face| {
             (0..face.points.len()).map(move |index| {
                 [
-                    face.points[index],
-                    face.points[(index + 1) % face.points.len()],
+                    (face.world_points[index], face.points[index]),
+                    (
+                        face.world_points[(index + 1) % face.points.len()],
+                        face.points[(index + 1) % face.points.len()],
+                    ),
                 ]
             })
         })
         .collect::<Vec<_>>();
-    let mut edge_counts = BTreeMap::<ScreenEdgeKey, ([egui::Pos2; 2], usize)>::new();
+    let mut edge_counts = BTreeMap::<GridEdgeKey, ([egui::Pos2; 2], usize)>::new();
     for edge in &face_edges {
-        for [start, end] in split_screen_edge_at_shared_endpoints(*edge, &face_edges) {
-            let key = screen_edge_key(start, end);
+        for [(start_world, start), (end_world, end)] in
+            split_world_edge_at_shared_endpoints(*edge, &face_edges)
+        {
+            let key = GridEdgeKey::new(start_world, end_world);
             let entry = edge_counts.entry(key).or_insert(([start, end], 0));
             entry.1 += 1;
         }
@@ -3131,14 +3152,35 @@ fn boundary_edges(faces: &[&RenderFace]) -> Vec<[egui::Pos2; 2]> {
         .collect()
 }
 
-fn split_screen_edge_at_shared_endpoints(
-    edge: [egui::Pos2; 2],
-    all_edges: &[[egui::Pos2; 2]],
-) -> Vec<[egui::Pos2; 2]> {
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GridEdgeKey {
+    start: GridVertex,
+    end: GridVertex,
+}
+
+impl GridEdgeKey {
+    fn new(start: GridVertex, end: GridVertex) -> Self {
+        if start <= end {
+            Self { start, end }
+        } else {
+            Self {
+                start: end,
+                end: start,
+            }
+        }
+    }
+}
+
+type ProjectedEdge = [(GridVertex, egui::Pos2); 2];
+
+fn split_world_edge_at_shared_endpoints(
+    edge: ProjectedEdge,
+    all_edges: &[ProjectedEdge],
+) -> Vec<ProjectedEdge> {
     let mut parameters = vec![0.0_f32, 1.0];
     for candidate in all_edges {
-        for point in candidate {
-            if let Some(parameter) = point_on_screen_segment_parameter(*point, edge) {
+        for (point, _) in candidate {
+            if let Some(parameter) = point_on_grid_segment_parameter(*point, edge) {
                 parameters.push(parameter);
             }
         }
@@ -3151,45 +3193,49 @@ fn split_screen_edge_at_shared_endpoints(
             let [start_parameter, end_parameter] = *window else {
                 return None;
             };
-            let delta = edge[1] - edge[0];
-            let start = edge[0] + delta * start_parameter;
-            let end = edge[0] + delta * end_parameter;
-            (start.distance_sq(end) > 0.0001).then_some([start, end])
+            let start_world = interpolate_grid_vertex(edge[0].0, edge[1].0, start_parameter);
+            let end_world = interpolate_grid_vertex(edge[0].0, edge[1].0, end_parameter);
+            let start = edge[0].1 + (edge[1].1 - edge[0].1) * start_parameter;
+            let end = edge[0].1 + (edge[1].1 - edge[0].1) * end_parameter;
+            (start_world != end_world).then_some([(start_world, start), (end_world, end)])
         })
         .collect()
 }
 
-fn point_on_screen_segment_parameter(point: egui::Pos2, edge: [egui::Pos2; 2]) -> Option<f32> {
-    let delta = edge[1] - edge[0];
-    let length_squared = delta.length_sq();
-    if length_squared <= f32::EPSILON {
-        return None;
-    }
-    let parameter = (point - edge[0]).dot(delta) / length_squared;
-    if !(-0.0001..=1.0001).contains(&parameter) {
-        return None;
-    }
-    let projected = edge[0] + delta * parameter;
-    (projected.distance_sq(point) <= 0.0001).then_some(parameter.clamp(0.0, 1.0))
-}
-
-fn screen_edge_key(start: egui::Pos2, end: egui::Pos2) -> ScreenEdgeKey {
-    let start = quantized_screen_point(start);
-    let end = quantized_screen_point(end);
-    if start <= end {
-        ScreenEdgeKey { start, end }
-    } else {
-        ScreenEdgeKey {
-            start: end,
-            end: start,
+fn point_on_grid_segment_parameter(point: GridVertex, edge: ProjectedEdge) -> Option<f32> {
+    let start = edge[0].0;
+    let end = edge[1].0;
+    let delta = (end.x - start.x, end.y - start.y, end.z - start.z);
+    let (axis_delta, point_delta) = if delta.0 != 0 {
+        if point.y != start.y || point.z != start.z {
+            return None;
         }
+        (delta.0, point.x - start.x)
+    } else if delta.1 != 0 {
+        if point.x != start.x || point.z != start.z {
+            return None;
+        }
+        (delta.1, point.y - start.y)
+    } else if delta.2 != 0 {
+        if point.x != start.x || point.y != start.y {
+            return None;
+        }
+        (delta.2, point.z - start.z)
+    } else {
+        return None;
+    };
+    if point_delta.signum() != axis_delta.signum() && point_delta != 0 {
+        return None;
     }
+    let parameter = point_delta as f32 / axis_delta as f32;
+    (0.0..=1.0).contains(&parameter).then_some(parameter)
 }
 
-fn quantized_screen_point(point: egui::Pos2) -> (i32, i32) {
-    (
-        (point.x * 1000.0).round() as i32,
-        (point.y * 1000.0).round() as i32,
+fn interpolate_grid_vertex(start: GridVertex, end: GridVertex, parameter: f32) -> GridVertex {
+    GridVertex::new(
+        (start.x as f32 + (end.x - start.x) as f32 * parameter).round() as i32,
+        (start.y as f32 + (end.y - start.y) as f32 * parameter).round() as i32,
+        (start.z as f32 + (end.z - start.z) as f32 * parameter).round() as i32,
     )
 }
 
@@ -3367,48 +3413,55 @@ impl FaceDirection {
         }
     }
 
-    fn corners(self, plane: i32, u_min: i32, u_max: i32, v_min: i32, v_max: i32) -> [Vec3; 4] {
-        let plane = plane as f32 - 0.5;
-        let u_min = u_min as f32 - 0.5;
-        let u_max = u_max as f32 - 0.5;
-        let v_min = v_min as f32 - 0.5;
-        let v_max = v_max as f32 - 0.5;
+    fn grid_corners(
+        self,
+        plane: i32,
+        u_min: i32,
+        u_max: i32,
+        v_min: i32,
+        v_max: i32,
+    ) -> [GridVertex; 4] {
+        let plane = plane * 2 - 1;
+        let u_min = u_min * 2 - 1;
+        let u_max = u_max * 2 - 1;
+        let v_min = v_min * 2 - 1;
+        let v_max = v_max * 2 - 1;
         match self {
             Self::PositiveX => [
-                Vec3::new(plane, u_min, v_min),
-                Vec3::new(plane, u_max, v_min),
-                Vec3::new(plane, u_max, v_max),
-                Vec3::new(plane, u_min, v_max),
+                GridVertex::new(plane, u_min, v_min),
+                GridVertex::new(plane, u_max, v_min),
+                GridVertex::new(plane, u_max, v_max),
+                GridVertex::new(plane, u_min, v_max),
             ],
             Self::NegativeX => [
-                Vec3::new(plane, u_max, v_min),
-                Vec3::new(plane, u_min, v_min),
-                Vec3::new(plane, u_min, v_max),
-                Vec3::new(plane, u_max, v_max),
+                GridVertex::new(plane, u_max, v_min),
+                GridVertex::new(plane, u_min, v_min),
+                GridVertex::new(plane, u_min, v_max),
+                GridVertex::new(plane, u_max, v_max),
             ],
             Self::PositiveY => [
-                Vec3::new(u_max, plane, v_min),
-                Vec3::new(u_min, plane, v_min),
-                Vec3::new(u_min, plane, v_max),
-                Vec3::new(u_max, plane, v_max),
+                GridVertex::new(u_max, plane, v_min),
+                GridVertex::new(u_min, plane, v_min),
+                GridVertex::new(u_min, plane, v_max),
+                GridVertex::new(u_max, plane, v_max),
             ],
             Self::NegativeY => [
-                Vec3::new(u_min, plane, v_min),
-                Vec3::new(u_max, plane, v_min),
-                Vec3::new(u_max, plane, v_max),
-                Vec3::new(u_min, plane, v_max),
+                GridVertex::new(u_min, plane, v_min),
+                GridVertex::new(u_max, plane, v_min),
+                GridVertex::new(u_max, plane, v_max),
+                GridVertex::new(u_min, plane, v_max),
             ],
             Self::PositiveZ => [
-                Vec3::new(u_min, v_min, plane),
-                Vec3::new(u_max, v_min, plane),
-                Vec3::new(u_max, v_max, plane),
-                Vec3::new(u_min, v_max, plane),
+                GridVertex::new(u_min, v_min, plane),
+                GridVertex::new(u_max, v_min, plane),
+                GridVertex::new(u_max, v_max, plane),
+                GridVertex::new(u_min, v_max, plane),
             ],
             Self::NegativeZ => [
-                Vec3::new(u_min, v_max, plane),
-                Vec3::new(u_max, v_max, plane),
-                Vec3::new(u_max, v_min, plane),
-                Vec3::new(u_min, v_min, plane),
+                GridVertex::new(u_min, v_max, plane),
+                GridVertex::new(u_max, v_max, plane),
+                GridVertex::new(u_max, v_min, plane),
+                GridVertex::new(u_min, v_min, plane),
             ],
         }
     }
@@ -3499,8 +3552,9 @@ fn append_greedy_face(
     }
     let mut points = Vec::with_capacity(4);
     let mut depth = 0.0;
-    for corner in direction.corners(plane, u_min, u_max, v_min, v_max) {
-        let camera_point = camera.orientation * (corner - camera.target);
+    let world_points = direction.grid_corners(plane, u_min, u_max, v_min, v_max);
+    for corner in world_points {
+        let camera_point = camera.orientation * (corner.to_vec3() - camera.target);
         depth += camera_point.z;
         points.push(project_point(center, camera_point, camera));
     }
@@ -3514,6 +3568,7 @@ fn append_greedy_face(
         object,
         depth: depth / 4.0,
         points,
+        world_points,
         color: egui::Color32::from_rgb(
             (color.0 as f32 * light) as u8,
             (color.1 as f32 * light) as u8,
@@ -3537,6 +3592,15 @@ fn project_point(center: egui::Pos2, point: Vec3, camera: &Camera) -> egui::Pos2
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
+
+    fn test_world_points(x_min: i32, y_min: i32, x_max: i32, y_max: i32) -> [GridVertex; 4] {
+        [
+            GridVertex::new(x_min, y_min, 0),
+            GridVertex::new(x_max, y_min, 0),
+            GridVertex::new(x_max, y_max, 0),
+            GridVertex::new(x_min, y_max, 0),
+        ]
+    }
 
     #[test]
     fn only_groups_are_valid_reparent_targets_and_cycles_are_rejected() {
@@ -3629,12 +3693,14 @@ mod presentation_tests {
                 object: ObjectRef::Piece(1),
                 depth: 0.0,
                 points: square.clone(),
+                world_points: test_world_points(0, 0, 10, 10),
                 color: egui::Color32::WHITE,
             },
             RenderFace {
                 object: ObjectRef::Piece(2),
                 depth: 1.0,
                 points: square,
+                world_points: test_world_points(0, 0, 10, 10),
                 color: egui::Color32::WHITE,
             },
         ];
@@ -3657,6 +3723,7 @@ mod presentation_tests {
                 egui::pos2(10.0, 10.0),
                 egui::pos2(0.0, 10.0),
             ],
+            world_points: test_world_points(0, 0, 10, 10),
             color: egui::Color32::WHITE,
         };
         let right = RenderFace {
@@ -3668,14 +3735,17 @@ mod presentation_tests {
                 egui::pos2(20.0, 10.0),
                 egui::pos2(10.0, 10.0),
             ],
+            world_points: test_world_points(10, 0, 20, 10),
             color: egui::Color32::WHITE,
         };
 
         let edges = boundary_edges(&[&left, &right]);
         assert_eq!(edges.len(), 6);
         assert!(!edges.iter().any(|edge| {
-            screen_edge_key(edge[0], edge[1])
-                == screen_edge_key(egui::pos2(10.0, 0.0), egui::pos2(10.0, 10.0))
+            edge[0].x == 10.0
+                && edge[1].x == 10.0
+                && edge[0].y.min(edge[1].y) == 0.0
+                && edge[0].y.max(edge[1].y) == 10.0
         }));
     }
 
@@ -3690,6 +3760,7 @@ mod presentation_tests {
                 egui::pos2(10.0, 20.0),
                 egui::pos2(0.0, 20.0),
             ],
+            world_points: test_world_points(0, 0, 10, 20),
             color: egui::Color32::WHITE,
         };
         let top_right = RenderFace {
@@ -3701,6 +3772,7 @@ mod presentation_tests {
                 egui::pos2(20.0, 10.0),
                 egui::pos2(10.0, 10.0),
             ],
+            world_points: test_world_points(10, 0, 20, 10),
             color: egui::Color32::WHITE,
         };
         let bottom_right = RenderFace {
@@ -3712,16 +3784,17 @@ mod presentation_tests {
                 egui::pos2(20.0, 20.0),
                 egui::pos2(10.0, 20.0),
             ],
+            world_points: test_world_points(10, 10, 20, 20),
             color: egui::Color32::WHITE,
         };
 
         let edges = boundary_edges(&[&left, &top_right, &bottom_right]);
 
         assert!(!edges.iter().any(|edge| {
-            screen_edge_key(edge[0], edge[1])
-                == screen_edge_key(egui::pos2(10.0, 0.0), egui::pos2(10.0, 10.0))
-                || screen_edge_key(edge[0], edge[1])
-                    == screen_edge_key(egui::pos2(10.0, 10.0), egui::pos2(10.0, 20.0))
+            edge[0].x == 10.0
+                && edge[1].x == 10.0
+                && (edge[0].y.min(edge[1].y) == 0.0 || edge[0].y.min(edge[1].y) == 10.0)
+                && (edge[0].y.max(edge[1].y) == 10.0 || edge[0].y.max(edge[1].y) == 20.0)
         }));
     }
 
@@ -3814,6 +3887,7 @@ mod presentation_tests {
                     egui::pos2(10.0, 10.0),
                     egui::pos2(0.0, 10.0),
                 ],
+                world_points: test_world_points(0, 0, 10, 10),
                 color: egui::Color32::RED,
             },
             RenderFace {
@@ -3825,6 +3899,7 @@ mod presentation_tests {
                     egui::pos2(20.0, 10.0),
                     egui::pos2(10.0, 10.0),
                 ],
+                world_points: test_world_points(10, 0, 20, 10),
                 color: egui::Color32::RED,
             },
         ];
