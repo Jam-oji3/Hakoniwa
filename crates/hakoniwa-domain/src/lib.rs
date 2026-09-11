@@ -755,6 +755,93 @@ impl Project {
         Ok(())
     }
 
+    pub fn rotate_object_quarter_around_world(
+        &mut self,
+        object: ObjectRef,
+        axis: GridAxis,
+        quarter_turns: i8,
+        pivot_world: GridPosition,
+    ) -> Result<(), DomainError> {
+        let parent_group = self.object_parent_group(object)?;
+        let (parent_rotation, parent_translation) = if let Some(parent) = parent_group {
+            self.group_world_transform(parent)?
+        } else {
+            (GridRotation::IDENTITY, GridPosition::ZERO)
+        };
+        let pivot_from_parent = GridPosition::new(
+            pivot_world.x - parent_translation.x,
+            pivot_world.y - parent_translation.y,
+            pivot_world.z - parent_translation.z,
+        );
+        let pivot_local = parent_rotation.inverse().apply(pivot_from_parent);
+        let world_turn = GridRotation::IDENTITY.rotate_quarter(axis, quarter_turns);
+        let local_turn = parent_rotation
+            .inverse()
+            .compose(world_turn)
+            .compose(parent_rotation);
+        let placement = match object {
+            ObjectRef::Group(id) => {
+                &mut self
+                    .groups
+                    .get_mut(&id)
+                    .ok_or(DomainError::GroupNotFound(id))?
+                    .placement
+            }
+            ObjectRef::Shape(id) => {
+                &mut self
+                    .shapes
+                    .get_mut(&id)
+                    .ok_or(DomainError::ShapeNotFound(id))?
+                    .placement
+            }
+            ObjectRef::Piece(id) => {
+                &mut self
+                    .pieces
+                    .get_mut(&id)
+                    .ok_or(DomainError::PieceNotFound(id))?
+                    .placement
+            }
+        };
+        let offset = GridPosition::new(
+            placement.translation.x - pivot_local.x,
+            placement.translation.y - pivot_local.y,
+            placement.translation.z - pivot_local.z,
+        );
+        let rotated_offset = local_turn.apply(offset);
+        placement.translation = GridPosition::new(
+            pivot_local.x + rotated_offset.x,
+            pivot_local.y + rotated_offset.y,
+            pivot_local.z + rotated_offset.z,
+        );
+        placement.rotation = local_turn.compose(placement.rotation);
+        Ok(())
+    }
+
+    fn group_world_transform(
+        &self,
+        group_id: ObjectId,
+    ) -> Result<(GridRotation, GridPosition), DomainError> {
+        let mut chain = Vec::new();
+        let mut current = Some(group_id);
+        while let Some(id) = current {
+            let group = self.groups.get(&id).ok_or(DomainError::GroupNotFound(id))?;
+            chain.push(group.placement);
+            current = group.parent_group_id;
+        }
+        let mut rotation = GridRotation::IDENTITY;
+        let mut translation = GridPosition::ZERO;
+        for placement in chain.into_iter().rev() {
+            let rotated_translation = rotation.apply(placement.translation);
+            translation = GridPosition::new(
+                translation.x + rotated_translation.x,
+                translation.y + rotated_translation.y,
+                translation.z + rotated_translation.z,
+            );
+            rotation = rotation.compose(placement.rotation);
+        }
+        Ok((rotation, translation))
+    }
+
     pub fn set_visibility(&mut self, object: ObjectRef, visible: bool) -> Result<(), DomainError> {
         match object {
             ObjectRef::Group(id) => {
@@ -1559,6 +1646,31 @@ mod tests {
         let position = GridPosition::new(3, -5, 7);
 
         assert_eq!(rotation.inverse().apply(rotation.apply(position)), position);
+    }
+
+    #[test]
+    fn rotation_around_world_pivot_updates_translation_and_orientation() {
+        let mut project = Project::new("pivot rotation");
+        let root = project.root_group_id();
+        let piece = project
+            .create_piece(root, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+
+        project
+            .rotate_object_quarter_around_world(
+                ObjectRef::Piece(piece),
+                GridAxis::Z,
+                1,
+                GridPosition::new(2, 1, 0),
+            )
+            .unwrap();
+
+        let placement = project.pieces[&piece].placement;
+        assert_eq!(placement.translation, GridPosition::new(3, -1, 0));
+        assert_eq!(
+            placement.rotation.apply(GridPosition::new(1, 0, 0)),
+            GridPosition::new(0, 1, 0)
+        );
     }
 
     #[test]

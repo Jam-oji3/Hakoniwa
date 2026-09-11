@@ -67,6 +67,12 @@ pub enum Command {
         axis: GridAxis,
         quarter_turns: i8,
     },
+    RotateQuarterAround {
+        object: ObjectRef,
+        axis: GridAxis,
+        quarter_turns: i8,
+        pivot_world: GridPosition,
+    },
     SetVisibility {
         object: ObjectRef,
         visible: bool,
@@ -293,6 +299,16 @@ fn apply_command(project: &mut Project, command: Command) -> Result<CommandResul
         } => {
             record_affected_pieces(project, object, &mut result.changes);
             project.rotate_object_quarter(object, axis, quarter_turns)?;
+            record_object(&mut result.changes, object);
+        }
+        Command::RotateQuarterAround {
+            object,
+            axis,
+            quarter_turns,
+            pivot_world,
+        } => {
+            record_affected_pieces(project, object, &mut result.changes);
+            project.rotate_object_quarter_around_world(object, axis, quarter_turns, pivot_world)?;
             record_object(&mut result.changes, object);
         }
         Command::SetVisibility { object, visible } => {
@@ -645,6 +661,23 @@ mod tests {
         assert_eq!(editor.project().pieces[&piece].placement.rotation, before);
         assert!(editor.redo());
         assert_ne!(editor.project().pieces[&piece].placement.rotation, before);
+    }
+
+    #[test]
+    fn pivot_rotation_is_undoable_as_one_command() {
+        let (mut editor, piece) = piece_editor();
+        let before = editor.project().pieces[&piece].placement;
+        editor
+            .execute(Command::RotateQuarterAround {
+                object: ObjectRef::Piece(piece),
+                axis: GridAxis::Z,
+                quarter_turns: 1,
+                pivot_world: GridPosition::new(2, 1, 0),
+            })
+            .unwrap();
+        assert_ne!(editor.project().pieces[&piece].placement, before);
+        assert!(editor.undo());
+        assert_eq!(editor.project().pieces[&piece].placement, before);
     }
 
     #[test]
