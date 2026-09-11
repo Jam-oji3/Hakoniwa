@@ -3106,20 +3106,71 @@ struct ScreenEdgeKey {
 }
 
 fn boundary_edges(faces: &[&RenderFace]) -> Vec<[egui::Pos2; 2]> {
-    let mut edges = BTreeMap::<ScreenEdgeKey, ([egui::Pos2; 2], usize)>::new();
-    for face in faces {
-        for index in 0..face.points.len() {
-            let start = face.points[index];
-            let end = face.points[(index + 1) % face.points.len()];
+    let face_edges = faces
+        .iter()
+        .flat_map(|face| {
+            (0..face.points.len()).map(move |index| {
+                [
+                    face.points[index],
+                    face.points[(index + 1) % face.points.len()],
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut edge_counts = BTreeMap::<ScreenEdgeKey, ([egui::Pos2; 2], usize)>::new();
+    for edge in &face_edges {
+        for [start, end] in split_screen_edge_at_shared_endpoints(*edge, &face_edges) {
             let key = screen_edge_key(start, end);
-            let entry = edges.entry(key).or_insert(([start, end], 0));
+            let entry = edge_counts.entry(key).or_insert(([start, end], 0));
             entry.1 += 1;
         }
     }
-    edges
+    edge_counts
         .into_values()
         .filter_map(|(edge, count)| (count == 1).then_some(edge))
         .collect()
+}
+
+fn split_screen_edge_at_shared_endpoints(
+    edge: [egui::Pos2; 2],
+    all_edges: &[[egui::Pos2; 2]],
+) -> Vec<[egui::Pos2; 2]> {
+    let mut parameters = vec![0.0_f32, 1.0];
+    for candidate in all_edges {
+        for point in candidate {
+            if let Some(parameter) = point_on_screen_segment_parameter(*point, edge) {
+                parameters.push(parameter);
+            }
+        }
+    }
+    parameters.sort_by(f32::total_cmp);
+    parameters.dedup_by(|left, right| (*left - *right).abs() < 0.0001);
+    parameters
+        .windows(2)
+        .filter_map(|window| {
+            let [start_parameter, end_parameter] = *window else {
+                return None;
+            };
+            let delta = edge[1] - edge[0];
+            let start = edge[0] + delta * start_parameter;
+            let end = edge[0] + delta * end_parameter;
+            (start.distance_sq(end) > 0.0001).then_some([start, end])
+        })
+        .collect()
+}
+
+fn point_on_screen_segment_parameter(point: egui::Pos2, edge: [egui::Pos2; 2]) -> Option<f32> {
+    let delta = edge[1] - edge[0];
+    let length_squared = delta.length_sq();
+    if length_squared <= f32::EPSILON {
+        return None;
+    }
+    let parameter = (point - edge[0]).dot(delta) / length_squared;
+    if !(-0.0001..=1.0001).contains(&parameter) {
+        return None;
+    }
+    let projected = edge[0] + delta * parameter;
+    (projected.distance_sq(point) <= 0.0001).then_some(parameter.clamp(0.0, 1.0))
 }
 
 fn screen_edge_key(start: egui::Pos2, end: egui::Pos2) -> ScreenEdgeKey {
@@ -3625,6 +3676,52 @@ mod presentation_tests {
         assert!(!edges.iter().any(|edge| {
             screen_edge_key(edge[0], edge[1])
                 == screen_edge_key(egui::pos2(10.0, 0.0), egui::pos2(10.0, 10.0))
+        }));
+    }
+
+    #[test]
+    fn selection_outline_omits_t_junctions_between_greedy_rectangles() {
+        let left = RenderFace {
+            object: ObjectRef::Piece(1),
+            depth: 0.0,
+            points: vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 0.0),
+                egui::pos2(10.0, 20.0),
+                egui::pos2(0.0, 20.0),
+            ],
+            color: egui::Color32::WHITE,
+        };
+        let top_right = RenderFace {
+            object: ObjectRef::Piece(1),
+            depth: 0.0,
+            points: vec![
+                egui::pos2(10.0, 0.0),
+                egui::pos2(20.0, 0.0),
+                egui::pos2(20.0, 10.0),
+                egui::pos2(10.0, 10.0),
+            ],
+            color: egui::Color32::WHITE,
+        };
+        let bottom_right = RenderFace {
+            object: ObjectRef::Piece(1),
+            depth: 0.0,
+            points: vec![
+                egui::pos2(10.0, 10.0),
+                egui::pos2(20.0, 10.0),
+                egui::pos2(20.0, 20.0),
+                egui::pos2(10.0, 20.0),
+            ],
+            color: egui::Color32::WHITE,
+        };
+
+        let edges = boundary_edges(&[&left, &top_right, &bottom_right]);
+
+        assert!(!edges.iter().any(|edge| {
+            screen_edge_key(edge[0], edge[1])
+                == screen_edge_key(egui::pos2(10.0, 0.0), egui::pos2(10.0, 10.0))
+                || screen_edge_key(edge[0], edge[1])
+                    == screen_edge_key(egui::pos2(10.0, 10.0), egui::pos2(10.0, 20.0))
         }));
     }
 
