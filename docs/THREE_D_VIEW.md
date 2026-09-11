@@ -90,6 +90,7 @@
 
 - Domain Objectからワールド座標のボクセル描画データへの変換は、Presentation内のAdapterへ分離する。
 - AdapterはPiece/Shape単位で描画データをキャッシュし、Applicationの`ChangeSet`で変更対象だけを無効化する。
+- 3Dの可視面は、同一Object・同一色・同一平面で隣接する単位面をGreedy Meshingで最大の長方形へ統合する。色またはObjectが異なる境界は統合しない。
 - Group変換、Undo/Redo、Projectの新規作成・読込では、階層影響を漏らさないため全キャッシュを無効化する。
 - 移動・回転プレビューは一時Adapterで描画し、確定前の状態を通常キャッシュへ混在させない。
 - カメラ依存の投影と可視面判定は毎フレーム導出し、Domainや保存データには保持しない。

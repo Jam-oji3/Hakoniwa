@@ -3071,17 +3071,14 @@ fn render_voxels(
     };
     let mut faces = Vec::new();
     for cached in visible_objects {
-        for (position, color) in &cached.voxels {
-            append_faces(
-                &mut faces,
-                rect.center(),
-                cached.object,
-                *position,
-                *color,
-                &occupied,
-                &camera,
-            );
-        }
+        append_greedy_faces(
+            &mut faces,
+            rect.center(),
+            cached.object,
+            &cached.voxels,
+            &occupied,
+            &camera,
+        );
     }
     faces.sort_by(|a, b| a.depth.total_cmp(&b.depth));
     for face in &faces {
@@ -3246,117 +3243,212 @@ fn group_chain_is_visible(project: &Project, mut group_id: ObjectId) -> bool {
     }
 }
 
-fn append_faces(
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum FaceDirection {
+    PositiveX,
+    NegativeX,
+    PositiveY,
+    NegativeY,
+    PositiveZ,
+    NegativeZ,
+}
+
+impl FaceDirection {
+    const ALL: [Self; 6] = [
+        Self::PositiveX,
+        Self::NegativeX,
+        Self::PositiveY,
+        Self::NegativeY,
+        Self::PositiveZ,
+        Self::NegativeZ,
+    ];
+
+    const fn neighbor(self) -> GridPosition {
+        match self {
+            Self::PositiveX => GridPosition::new(1, 0, 0),
+            Self::NegativeX => GridPosition::new(-1, 0, 0),
+            Self::PositiveY => GridPosition::new(0, 1, 0),
+            Self::NegativeY => GridPosition::new(0, -1, 0),
+            Self::PositiveZ => GridPosition::new(0, 0, 1),
+            Self::NegativeZ => GridPosition::new(0, 0, -1),
+        }
+    }
+
+    const fn normal(self) -> Vec3 {
+        match self {
+            Self::PositiveX => Vec3::X,
+            Self::NegativeX => Vec3::NEG_X,
+            Self::PositiveY => Vec3::Y,
+            Self::NegativeY => Vec3::NEG_Y,
+            Self::PositiveZ => Vec3::Z,
+            Self::NegativeZ => Vec3::NEG_Z,
+        }
+    }
+
+    const fn plane_and_cell(self, position: GridPosition) -> (i32, i32, i32) {
+        match self {
+            Self::PositiveX => (position.x + 1, position.y, position.z),
+            Self::NegativeX => (position.x, position.y, position.z),
+            Self::PositiveY => (position.y + 1, position.x, position.z),
+            Self::NegativeY => (position.y, position.x, position.z),
+            Self::PositiveZ => (position.z + 1, position.x, position.y),
+            Self::NegativeZ => (position.z, position.x, position.y),
+        }
+    }
+
+    fn corners(self, plane: i32, u_min: i32, u_max: i32, v_min: i32, v_max: i32) -> [Vec3; 4] {
+        let plane = plane as f32 - 0.5;
+        let u_min = u_min as f32 - 0.5;
+        let u_max = u_max as f32 - 0.5;
+        let v_min = v_min as f32 - 0.5;
+        let v_max = v_max as f32 - 0.5;
+        match self {
+            Self::PositiveX => [
+                Vec3::new(plane, u_min, v_min),
+                Vec3::new(plane, u_max, v_min),
+                Vec3::new(plane, u_max, v_max),
+                Vec3::new(plane, u_min, v_max),
+            ],
+            Self::NegativeX => [
+                Vec3::new(plane, u_max, v_min),
+                Vec3::new(plane, u_min, v_min),
+                Vec3::new(plane, u_min, v_max),
+                Vec3::new(plane, u_max, v_max),
+            ],
+            Self::PositiveY => [
+                Vec3::new(u_max, plane, v_min),
+                Vec3::new(u_min, plane, v_min),
+                Vec3::new(u_min, plane, v_max),
+                Vec3::new(u_max, plane, v_max),
+            ],
+            Self::NegativeY => [
+                Vec3::new(u_min, plane, v_min),
+                Vec3::new(u_max, plane, v_min),
+                Vec3::new(u_max, plane, v_max),
+                Vec3::new(u_min, plane, v_max),
+            ],
+            Self::PositiveZ => [
+                Vec3::new(u_min, v_min, plane),
+                Vec3::new(u_max, v_min, plane),
+                Vec3::new(u_max, v_max, plane),
+                Vec3::new(u_min, v_max, plane),
+            ],
+            Self::NegativeZ => [
+                Vec3::new(u_min, v_max, plane),
+                Vec3::new(u_max, v_max, plane),
+                Vec3::new(u_max, v_min, plane),
+                Vec3::new(u_min, v_min, plane),
+            ],
+        }
+    }
+}
+
+fn append_greedy_faces(
     output: &mut Vec<RenderFace>,
     center: egui::Pos2,
     object: ObjectRef,
-    position: GridPosition,
-    color: Color,
+    voxels: &[(GridPosition, Color)],
     occupied: &BTreeSet<GridPosition>,
     camera: &Camera,
 ) {
-    let x = position.x as f32;
-    let y = position.y as f32;
-    let z = position.z as f32;
-    let definitions = [
-        (
-            GridPosition::new(1, 0, 0),
-            Vec3::X,
-            [
-                Vec3::new(0.5, -0.5, -0.5),
-                Vec3::new(0.5, 0.5, -0.5),
-                Vec3::new(0.5, 0.5, 0.5),
-                Vec3::new(0.5, -0.5, 0.5),
-            ],
-        ),
-        (
-            GridPosition::new(-1, 0, 0),
-            Vec3::NEG_X,
-            [
-                Vec3::new(-0.5, 0.5, -0.5),
-                Vec3::new(-0.5, -0.5, -0.5),
-                Vec3::new(-0.5, -0.5, 0.5),
-                Vec3::new(-0.5, 0.5, 0.5),
-            ],
-        ),
-        (
-            GridPosition::new(0, 1, 0),
-            Vec3::Y,
-            [
-                Vec3::new(0.5, 0.5, -0.5),
-                Vec3::new(-0.5, 0.5, -0.5),
-                Vec3::new(-0.5, 0.5, 0.5),
-                Vec3::new(0.5, 0.5, 0.5),
-            ],
-        ),
-        (
-            GridPosition::new(0, -1, 0),
-            Vec3::NEG_Y,
-            [
-                Vec3::new(-0.5, -0.5, -0.5),
-                Vec3::new(0.5, -0.5, -0.5),
-                Vec3::new(0.5, -0.5, 0.5),
-                Vec3::new(-0.5, -0.5, 0.5),
-            ],
-        ),
-        (
-            GridPosition::new(0, 0, 1),
-            Vec3::Z,
-            [
-                Vec3::new(-0.5, -0.5, 0.5),
-                Vec3::new(0.5, -0.5, 0.5),
-                Vec3::new(0.5, 0.5, 0.5),
-                Vec3::new(-0.5, 0.5, 0.5),
-            ],
-        ),
-        (
-            GridPosition::new(0, 0, -1),
-            Vec3::NEG_Z,
-            [
-                Vec3::new(-0.5, 0.5, -0.5),
-                Vec3::new(0.5, 0.5, -0.5),
-                Vec3::new(0.5, -0.5, -0.5),
-                Vec3::new(-0.5, -0.5, -0.5),
-            ],
-        ),
-    ];
-    for (neighbor, normal, corners) in definitions {
-        let adjacent = GridPosition::new(
-            position.x + neighbor.x,
-            position.y + neighbor.y,
-            position.z + neighbor.z,
-        );
-        if occupied.contains(&adjacent) {
-            continue;
+    let mut surface_cells = BTreeMap::<(FaceDirection, i32), BTreeMap<(i32, i32), Color>>::new();
+    for (position, color) in voxels {
+        for direction in FaceDirection::ALL {
+            let neighbor = direction.neighbor();
+            let adjacent = GridPosition::new(
+                position.x + neighbor.x,
+                position.y + neighbor.y,
+                position.z + neighbor.z,
+            );
+            if occupied.contains(&adjacent) {
+                continue;
+            }
+            let (plane, u, v) = direction.plane_and_cell(*position);
+            surface_cells
+                .entry((direction, plane))
+                .or_default()
+                .insert((u, v), *color);
         }
-        let camera_normal = camera.orientation * normal;
-        if camera_normal.z <= 0.001 {
-            continue;
-        }
-        let mut points = Vec::with_capacity(4);
-        let mut depth = 0.0;
-        for corner in corners {
-            let camera_point = camera.orientation * (Vec3::new(x, y, z) + corner - camera.target);
-            depth += camera_point.z;
-            points.push(project_point(center, camera_point, camera));
-        }
-        let light = (0.45
-            + 0.55
-                * camera_normal
-                    .dot(Vec3::new(0.3, 0.4, 0.866).normalize())
-                    .abs())
-        .clamp(0.35, 1.0);
-        output.push(RenderFace {
-            object,
-            depth: depth / 4.0,
-            points,
-            color: egui::Color32::from_rgb(
-                (color.0 as f32 * light) as u8,
-                (color.1 as f32 * light) as u8,
-                (color.2 as f32 * light) as u8,
-            ),
-        });
     }
+
+    for ((direction, plane), mut cells) in surface_cells {
+        while let Some((&(u_min, v_min), &color)) = cells.iter().next() {
+            let mut width = 1;
+            while cells.get(&(u_min + width, v_min)) == Some(&color) {
+                width += 1;
+            }
+            let mut height = 1;
+            'grow: loop {
+                for u in u_min..u_min + width {
+                    if cells.get(&(u, v_min + height)) != Some(&color) {
+                        break 'grow;
+                    }
+                }
+                height += 1;
+            }
+            for u in u_min..u_min + width {
+                for v in v_min..v_min + height {
+                    cells.remove(&(u, v));
+                }
+            }
+            append_greedy_face(
+                output,
+                center,
+                object,
+                direction,
+                plane,
+                u_min,
+                u_min + width,
+                v_min,
+                v_min + height,
+                color,
+                camera,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_greedy_face(
+    output: &mut Vec<RenderFace>,
+    center: egui::Pos2,
+    object: ObjectRef,
+    direction: FaceDirection,
+    plane: i32,
+    u_min: i32,
+    u_max: i32,
+    v_min: i32,
+    v_max: i32,
+    color: Color,
+    camera: &Camera,
+) {
+    let camera_normal = camera.orientation * direction.normal();
+    if camera_normal.z <= 0.001 {
+        return;
+    }
+    let mut points = Vec::with_capacity(4);
+    let mut depth = 0.0;
+    for corner in direction.corners(plane, u_min, u_max, v_min, v_max) {
+        let camera_point = camera.orientation * (corner - camera.target);
+        depth += camera_point.z;
+        points.push(project_point(center, camera_point, camera));
+    }
+    let light = (0.45
+        + 0.55
+            * camera_normal
+                .dot(Vec3::new(0.3, 0.4, 0.866).normalize())
+                .abs())
+    .clamp(0.35, 1.0);
+    output.push(RenderFace {
+        object,
+        depth: depth / 4.0,
+        points,
+        color: egui::Color32::from_rgb(
+            (color.0 as f32 * light) as u8,
+            (color.1 as f32 * light) as u8,
+            (color.2 as f32 * light) as u8,
+        ),
+    });
 }
 
 fn project_point(center: egui::Pos2, point: Vec3, camera: &Camera) -> egui::Pos2 {
@@ -3514,6 +3606,83 @@ mod presentation_tests {
             screen_edge_key(edge[0], edge[1])
                 == screen_edge_key(egui::pos2(10.0, 0.0), egui::pos2(10.0, 10.0))
         }));
+    }
+
+    #[test]
+    fn greedy_meshing_merges_a_same_color_plane_into_one_visible_face() {
+        let voxels = vec![
+            (GridPosition::new(0, 0, 0), Color::RED),
+            (GridPosition::new(1, 0, 0), Color::RED),
+            (GridPosition::new(0, 1, 0), Color::RED),
+            (GridPosition::new(1, 1, 0), Color::RED),
+        ];
+        let occupied = voxels.iter().map(|(position, _)| *position).collect();
+        let camera = Camera {
+            orientation: Quat::IDENTITY,
+            target: Vec3::ZERO,
+            pixels_per_unit: 10.0,
+            pan: egui::Vec2::ZERO,
+            perspective: false,
+            focal_distance: 10.0,
+        };
+        let mut faces = Vec::new();
+
+        append_greedy_faces(
+            &mut faces,
+            egui::Pos2::ZERO,
+            ObjectRef::Piece(1),
+            &voxels,
+            &occupied,
+            &camera,
+        );
+
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].points.len(), 4);
+        assert_eq!(
+            faces[0]
+                .points
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::INFINITY, f32::min),
+            -5.0
+        );
+        assert_eq!(
+            faces[0]
+                .points
+                .iter()
+                .map(|point| point.x)
+                .fold(f32::NEG_INFINITY, f32::max),
+            15.0
+        );
+    }
+
+    #[test]
+    fn greedy_meshing_preserves_color_boundaries() {
+        let voxels = vec![
+            (GridPosition::new(0, 0, 0), Color::RED),
+            (GridPosition::new(1, 0, 0), Color::BROWN),
+        ];
+        let occupied = voxels.iter().map(|(position, _)| *position).collect();
+        let camera = Camera {
+            orientation: Quat::IDENTITY,
+            target: Vec3::ZERO,
+            pixels_per_unit: 10.0,
+            pan: egui::Vec2::ZERO,
+            perspective: false,
+            focal_distance: 10.0,
+        };
+        let mut faces = Vec::new();
+
+        append_greedy_faces(
+            &mut faces,
+            egui::Pos2::ZERO,
+            ObjectRef::Piece(1),
+            &voxels,
+            &occupied,
+            &camera,
+        );
+
+        assert_eq!(faces.len(), 2);
     }
 
     #[test]
