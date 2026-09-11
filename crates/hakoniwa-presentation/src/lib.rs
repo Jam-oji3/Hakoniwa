@@ -6,7 +6,12 @@ use hakoniwa_application::{Command, Editor, ProjectRepository};
 use hakoniwa_domain::{
     Bead, Color, GridPosition, ObjectId, ObjectRef, Piece, Plane, Project, VoxelObjectRef,
 };
-use std::{collections::BTreeSet, fmt::Debug, path::PathBuf, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Debug,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use editor_2d::{GridPoint2d, PlateLayout, Viewport2d, project_position, unproject_position};
 
@@ -1738,15 +1743,60 @@ fn render_voxels(
             egui::Stroke::NONE,
         ));
     }
-    for face in &faces {
-        if object_is_selected(project, face.object, options.selected) {
-            painter.add(egui::Shape::closed_line(
-                face.points.clone(),
-                egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 132, 18)),
-            ));
-        }
+    let selected_faces = faces
+        .iter()
+        .filter(|face| object_is_selected(project, face.object, options.selected))
+        .collect::<Vec<_>>();
+    for edge in boundary_edges(&selected_faces) {
+        painter.line_segment(
+            edge,
+            egui::Stroke::new(2.5, egui::Color32::from_rgb(255, 132, 18)),
+        );
     }
     faces
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ScreenEdgeKey {
+    start: (i32, i32),
+    end: (i32, i32),
+}
+
+fn boundary_edges(faces: &[&RenderFace]) -> Vec<[egui::Pos2; 2]> {
+    let mut edges = BTreeMap::<ScreenEdgeKey, ([egui::Pos2; 2], usize)>::new();
+    for face in faces {
+        for index in 0..face.points.len() {
+            let start = face.points[index];
+            let end = face.points[(index + 1) % face.points.len()];
+            let key = screen_edge_key(start, end);
+            let entry = edges.entry(key).or_insert(([start, end], 0));
+            entry.1 += 1;
+        }
+    }
+    edges
+        .into_values()
+        .filter_map(|(edge, count)| (count == 1).then_some(edge))
+        .collect()
+}
+
+fn screen_edge_key(start: egui::Pos2, end: egui::Pos2) -> ScreenEdgeKey {
+    let start = quantized_screen_point(start);
+    let end = quantized_screen_point(end);
+    if start <= end {
+        ScreenEdgeKey { start, end }
+    } else {
+        ScreenEdgeKey {
+            start: end,
+            end: start,
+        }
+    }
+}
+
+fn quantized_screen_point(point: egui::Pos2) -> (i32, i32) {
+    (
+        (point.x * 1000.0).round() as i32,
+        (point.y * 1000.0).round() as i32,
+    )
 }
 
 fn translated_world_position(
@@ -2069,6 +2119,39 @@ mod presentation_tests {
             Some(ObjectRef::Piece(2))
         );
         assert_eq!(pick_rendered_object(&faces, egui::pos2(20.0, 20.0)), None);
+    }
+
+    #[test]
+    fn selection_outline_omits_edges_shared_by_neighboring_faces() {
+        let left = RenderFace {
+            object: ObjectRef::Piece(1),
+            depth: 0.0,
+            points: vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 0.0),
+                egui::pos2(10.0, 10.0),
+                egui::pos2(0.0, 10.0),
+            ],
+            color: egui::Color32::WHITE,
+        };
+        let right = RenderFace {
+            object: ObjectRef::Piece(1),
+            depth: 0.0,
+            points: vec![
+                egui::pos2(10.0, 0.0),
+                egui::pos2(20.0, 0.0),
+                egui::pos2(20.0, 10.0),
+                egui::pos2(10.0, 10.0),
+            ],
+            color: egui::Color32::WHITE,
+        };
+
+        let edges = boundary_edges(&[&left, &right]);
+        assert_eq!(edges.len(), 6);
+        assert!(!edges.iter().any(|edge| {
+            screen_edge_key(edge[0], edge[1])
+                == screen_edge_key(egui::pos2(10.0, 0.0), egui::pos2(10.0, 10.0))
+        }));
     }
 
     #[test]
