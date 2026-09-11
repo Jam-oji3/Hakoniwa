@@ -1679,7 +1679,13 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
         .input(|input| input.pointer.hover_pos())
         .filter(|pointer| rect.contains(*pointer));
     if let (Some(session), Some(pointer)) = (&mut context.editor.move_session, pointer) {
-        update_move_preview(project, session, pointer, context.editor.last_camera);
+        update_move_preview(
+            project,
+            session,
+            pointer,
+            rect.center(),
+            context.editor.last_camera,
+        );
     }
     let preview_project = context.editor.move_session.map(|session| {
         let mut preview = project.clone();
@@ -1720,7 +1726,9 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
                 response.clicked_by(egui::PointerButton::Primary)
                     || ui.input(|input| input.key_pressed(egui::Key::Enter))
             }
-            MoveSource::Gizmo => response.drag_stopped_by(egui::PointerButton::Primary),
+            MoveSource::Gizmo => {
+                ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
+            }
         });
     let cancel_move = move_was_active && response.clicked_by(egui::PointerButton::Secondary);
     if confirm_move {
@@ -1785,7 +1793,7 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
     let (Some(object), Some(camera)) = (context.selected, context.camera) else {
         return false;
     };
-    let Some(origin) = object_world_origin(context.project, object) else {
+    let Some(origin) = object_gizmo_center(context.project, object) else {
         return false;
     };
     let center = world_to_screen(context.rect.center(), origin, camera);
@@ -1793,8 +1801,12 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
     let hovered = match context.tool {
         TransformTool::Move => axes.into_iter().find(|axis| {
             context.pointer.is_some_and(|pointer| {
-                let end = center + projected_axis_direction(camera, *axis) * 48.0;
-                distance_to_segment(pointer, center, end) <= 7.0
+                projected_axis_direction(context.rect.center(), camera, origin, *axis).is_some_and(
+                    |direction| {
+                        let end = center + direction * 48.0;
+                        distance_to_segment(pointer, center, end) <= 7.0
+                    },
+                )
             })
         }),
         TransformTool::Rotate => axes.into_iter().find(|axis| {
@@ -1810,7 +1822,12 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
         let width = if hovered == Some(axis) { 4.0 } else { 2.5 };
         match context.tool {
             TransformTool::Move => {
-                let end = center + projected_axis_direction(camera, axis) * 48.0;
+                let Some(direction) =
+                    projected_axis_direction(context.rect.center(), camera, origin, axis)
+                else {
+                    continue;
+                };
+                let end = center + direction * 48.0;
                 context
                     .painter
                     .line_segment([center, end], egui::Stroke::new(width, color));
@@ -1927,6 +1944,65 @@ fn object_world_origin(project: &Project, object: ObjectRef) -> Option<Vec3> {
     ))
 }
 
+fn object_gizmo_center(project: &Project, object: ObjectRef) -> Option<Vec3> {
+    let mut minimum: Option<GridPosition> = None;
+    let mut maximum: Option<GridPosition> = None;
+    let mut include = |position: GridPosition| {
+        minimum = Some(minimum.map_or(position, |current| {
+            GridPosition::new(
+                current.x.min(position.x),
+                current.y.min(position.y),
+                current.z.min(position.z),
+            )
+        }));
+        maximum = Some(maximum.map_or(position, |current| {
+            GridPosition::new(
+                current.x.max(position.x),
+                current.y.max(position.y),
+                current.z.max(position.z),
+            )
+        }));
+    };
+
+    for piece in project.pieces.values().filter(|piece| {
+        piece.visible
+            && group_chain_is_visible(project, piece.parent_group_id)
+            && object_is_selected(project, ObjectRef::Piece(piece.id), Some(object))
+    }) {
+        for position in piece.beads.keys() {
+            include(transformed_world_position(
+                project,
+                piece.parent_group_id,
+                piece.placement,
+                *position,
+            ));
+        }
+    }
+    for shape in project.shapes.values().filter(|shape| {
+        shape.visible
+            && group_chain_is_visible(project, shape.parent_group_id)
+            && object_is_selected(project, ObjectRef::Shape(shape.id), Some(object))
+    }) {
+        for position in shape.beads.keys() {
+            include(transformed_world_position(
+                project,
+                shape.parent_group_id,
+                shape.placement,
+                *position,
+            ));
+        }
+    }
+
+    match (minimum, maximum) {
+        (Some(minimum), Some(maximum)) => Some(Vec3::new(
+            (minimum.x + maximum.x) as f32 * 0.5,
+            (minimum.y + maximum.y) as f32 * 0.5,
+            (minimum.z + maximum.z) as f32 * 0.5,
+        )),
+        _ => object_world_origin(project, object),
+    }
+}
+
 fn world_to_screen(center: egui::Pos2, world: Vec3, camera: &Camera) -> egui::Pos2 {
     project_point(center, camera.orientation * (world - camera.target), camera)
 }
@@ -1938,30 +2014,46 @@ fn draw_move_constraint_guide(
     session: MoveSession,
     camera: &Camera,
 ) {
-    let MoveConstraint::Axis(axis) = session.constraint else {
+    let Some(origin) = object_gizmo_center(project, session.object) else {
         return;
     };
-    let Some(origin) = object_world_origin(project, session.object) else {
-        return;
-    };
-    let projected = camera.orientation * axis_vector(axis);
-    let direction = egui::vec2(projected.x, -projected.y);
-    if direction.length_sq() <= f32::EPSILON {
-        return;
-    }
     let center = world_to_screen(rect.center(), origin, camera);
     let extent = rect.width() + rect.height();
-    let direction = direction.normalized() * extent;
-    painter.line_segment(
-        [center - direction, center + direction],
-        egui::Stroke::new(1.75, axis_color(axis)),
-    );
-    painter.circle_filled(center, 4.5, axis_color(axis));
+    let mut drew_guide = false;
+    for axis in [GridAxis::X, GridAxis::Y, GridAxis::Z] {
+        let show = match session.constraint {
+            MoveConstraint::ViewPlane => false,
+            MoveConstraint::Axis(constrained) => axis == constrained,
+            MoveConstraint::PlaneExcluding(excluded) => axis != excluded,
+        };
+        if !show {
+            continue;
+        }
+        let Some(direction) = projected_axis_direction(rect.center(), camera, origin, axis) else {
+            continue;
+        };
+        let direction = direction * extent;
+        painter.line_segment(
+            [center - direction, center + direction],
+            egui::Stroke::new(1.75, axis_color(axis)),
+        );
+        drew_guide = true;
+    }
+    if drew_guide {
+        painter.circle_filled(center, 4.5, egui::Color32::from_rgb(245, 245, 245));
+    }
 }
 
-fn projected_axis_direction(camera: &Camera, axis: GridAxis) -> egui::Vec2 {
-    let projected = camera.orientation * axis_vector(axis);
-    egui::vec2(projected.x, -projected.y).normalized()
+fn projected_axis_direction(
+    viewport_center: egui::Pos2,
+    camera: &Camera,
+    origin: Vec3,
+    axis: GridAxis,
+) -> Option<egui::Vec2> {
+    let start = world_to_screen(viewport_center, origin, camera);
+    let end = world_to_screen(viewport_center, origin + axis_vector(axis), camera);
+    let direction = end - start;
+    (direction.length_sq() > f32::EPSILON).then(|| direction.normalized())
 }
 
 fn rotation_ring_points(center: egui::Pos2, camera: &Camera, axis: GridAxis) -> Vec<egui::Pos2> {
@@ -2129,14 +2221,24 @@ fn update_move_preview(
     project: &Project,
     session: &mut MoveSession,
     pointer: egui::Pos2,
+    viewport_center: egui::Pos2,
     fallback_camera: Option<Camera>,
 ) {
     let Some(camera) = session.camera.or(fallback_camera) else {
         return;
     };
     session.camera = Some(camera);
-    let world_delta =
-        constrained_world_delta(&camera, pointer - session.start_pointer, session.constraint);
+    let axis_screen_direction = match session.constraint {
+        MoveConstraint::Axis(axis) => object_gizmo_center(project, session.object)
+            .and_then(|origin| projected_axis_direction(viewport_center, &camera, origin, axis)),
+        _ => None,
+    };
+    let world_delta = constrained_world_delta(
+        &camera,
+        pointer - session.start_pointer,
+        session.constraint,
+        axis_screen_direction,
+    );
     let local_delta = parent_world_rotation(project, session.object)
         .inverse()
         .apply(world_delta);
@@ -2148,13 +2250,16 @@ fn constrained_world_delta(
     camera: &Camera,
     screen_delta: egui::Vec2,
     constraint: MoveConstraint,
+    axis_screen_direction: Option<egui::Vec2>,
 ) -> GridPosition {
     if camera.pixels_per_unit <= f32::EPSILON {
         return GridPosition::ZERO;
     }
     if let MoveConstraint::Axis(axis) = constraint {
-        let projected = camera.orientation * axis_vector(axis);
-        let screen_axis = egui::vec2(projected.x, -projected.y);
+        let screen_axis = axis_screen_direction.unwrap_or_else(|| {
+            let projected = camera.orientation * axis_vector(axis);
+            egui::vec2(projected.x, -projected.y)
+        });
         if screen_axis.length_sq() <= f32::EPSILON {
             return GridPosition::ZERO;
         }
@@ -2859,7 +2964,8 @@ mod presentation_tests {
             constrained_world_delta(
                 &camera,
                 egui::vec2(20.0, -30.0),
-                MoveConstraint::PlaneExcluding(GridAxis::X)
+                MoveConstraint::PlaneExcluding(GridAxis::X),
+                None,
             ),
             GridPosition::new(0, 3, 0)
         );
@@ -2867,7 +2973,8 @@ mod presentation_tests {
             constrained_world_delta(
                 &camera,
                 egui::vec2(20.0, -30.0),
-                MoveConstraint::PlaneExcluding(GridAxis::Y)
+                MoveConstraint::PlaneExcluding(GridAxis::Y),
+                None,
             ),
             GridPosition::new(2, 0, 0)
         );
@@ -2889,6 +2996,47 @@ mod presentation_tests {
                 .inverse()
                 .apply(GridPosition::new(1, 0, 0)),
             GridPosition::new(0, -1, 0)
+        );
+    }
+
+    #[test]
+    fn gizmo_center_uses_the_selected_voxel_bounds() {
+        let mut project = Project::new("gizmo center");
+        let root = project.root_group_id();
+        let piece = project
+            .create_piece(root, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+        project
+            .add_bead(
+                VoxelObjectRef::Piece(piece),
+                Bead {
+                    position: GridPosition::new(0, 0, 0),
+                    color: Color::RED,
+                },
+            )
+            .unwrap();
+        project
+            .add_bead(
+                VoxelObjectRef::Piece(piece),
+                Bead {
+                    position: GridPosition::new(4, 2, 0),
+                    color: Color::RED,
+                },
+            )
+            .unwrap();
+        project
+            .set_placement(
+                ObjectRef::Piece(piece),
+                Placement {
+                    translation: GridPosition::new(10, -3, 1),
+                    ..Placement::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            object_gizmo_center(&project, ObjectRef::Piece(piece)),
+            Some(Vec3::new(12.0, -2.0, 1.0))
         );
     }
 }
