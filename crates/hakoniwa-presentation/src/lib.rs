@@ -15,6 +15,7 @@ enum WorkspacePane {
     PartsTree,
     PieceEditor,
     AssemblyView,
+    Inspector,
 }
 
 #[derive(Clone, Copy)]
@@ -22,11 +23,18 @@ struct WorkspacePaneIds {
     parts_tree: egui_tiles::TileId,
     piece_editor: egui_tiles::TileId,
     assembly_view: egui_tiles::TileId,
+    inspector: egui_tiles::TileId,
+}
+
+struct PendingCommand {
+    command: Command,
+    select_created: bool,
 }
 pub struct HakoniwaApp {
     editor: Editor,
     selected: Option<ObjectRef>,
     piece_editor: PieceEditorState,
+    tree_editor: TreeEditorState,
     status: String,
     zoom: f32,
     orientation: Quat,
@@ -61,6 +69,7 @@ impl HakoniwaApp {
             editor: Editor::new(hammer_project()),
             selected: None,
             piece_editor: PieceEditorState::default(),
+            tree_editor: TreeEditorState::default(),
             status: "ハンマーのMVPサンプルを読み込みました".into(),
             zoom: 1.0,
             orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
@@ -150,6 +159,7 @@ impl eframe::App for HakoniwaApp {
                     ("パーツツリー", self.pane_ids.parts_tree),
                     ("2Dエディタ", self.pane_ids.piece_editor),
                     ("3D View", self.pane_ids.assembly_view),
+                    ("インスペクタ", self.pane_ids.inspector),
                 ] {
                     let visible = self.workspace.tiles.is_visible(tile_id);
                     if ui.add_enabled(!visible, egui::Button::new(title)).clicked() {
@@ -172,6 +182,7 @@ impl eframe::App for HakoniwaApp {
                 project: self.editor.project(),
                 selected: &mut self.selected,
                 piece_editor: &mut self.piece_editor,
+                tree_editor: &mut self.tree_editor,
                 zoom: &mut self.zoom,
                 orientation: &mut self.orientation,
                 pan: &mut self.pan,
@@ -186,9 +197,14 @@ impl eframe::App for HakoniwaApp {
             behavior.commands
         };
 
-        for command in commands {
-            match self.editor.execute(command) {
-                Ok(_) => self.status = "編集しました".into(),
+        for pending in commands {
+            match self.editor.execute(pending.command) {
+                Ok(result) => {
+                    if pending.select_created && result.created_object.is_some() {
+                        self.selected = result.created_object;
+                    }
+                    self.status = "編集しました".into();
+                }
                 Err(error) => self.status = format!("編集できません: {error:?}"),
             }
         }
@@ -201,11 +217,14 @@ fn create_workspace_tree() -> (egui_tiles::Tree<WorkspacePane>, WorkspacePaneIds
         parts_tree: tiles.insert_pane(WorkspacePane::PartsTree),
         piece_editor: tiles.insert_pane(WorkspacePane::PieceEditor),
         assembly_view: tiles.insert_pane(WorkspacePane::AssemblyView),
+        inspector: tiles.insert_pane(WorkspacePane::Inspector),
     };
     let parts_tabs = tiles.insert_tab_tile(vec![pane_ids.parts_tree]);
     let editor_tabs = tiles.insert_tab_tile(vec![pane_ids.piece_editor]);
     let assembly_tabs = tiles.insert_tab_tile(vec![pane_ids.assembly_view]);
-    let root = tiles.insert_horizontal_tile(vec![parts_tabs, editor_tabs, assembly_tabs]);
+    let inspector_tabs = tiles.insert_tab_tile(vec![pane_ids.inspector]);
+    let root =
+        tiles.insert_horizontal_tile(vec![parts_tabs, editor_tabs, assembly_tabs, inspector_tabs]);
     (
         egui_tiles::Tree::new("hakoniwa-workspace", root, tiles),
         pane_ids,
@@ -216,12 +235,13 @@ struct WorkspaceBehavior<'a> {
     project: &'a Project,
     selected: &'a mut Option<ObjectRef>,
     piece_editor: &'a mut PieceEditorState,
+    tree_editor: &'a mut TreeEditorState,
     zoom: &'a mut f32,
     orientation: &'a mut Quat,
     pan: &'a mut egui::Vec2,
     perspective: &'a mut bool,
     close_requested: Option<egui_tiles::TileId>,
-    commands: Vec<Command>,
+    commands: Vec<PendingCommand>,
 }
 
 impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
@@ -234,7 +254,13 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
         ui.painter()
             .rect_filled(ui.max_rect(), 0.0, egui::Color32::WHITE);
         match pane {
-            WorkspacePane::PartsTree => draw_parts_tree(ui, self.project, self.selected),
+            WorkspacePane::PartsTree => draw_parts_tree(
+                ui,
+                self.project,
+                self.selected,
+                self.tree_editor,
+                &mut self.commands,
+            ),
             WorkspacePane::PieceEditor => draw_editor(
                 ui,
                 self.project
@@ -251,6 +277,7 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
                 self.pan,
                 self.perspective,
             ),
+            WorkspacePane::Inspector => draw_inspector(ui, self.project, *self.selected),
         }
         egui_tiles::UiResponse::None
     }
@@ -260,6 +287,7 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
             WorkspacePane::PartsTree => "パーツツリー",
             WorkspacePane::PieceEditor => "2Dエディタ",
             WorkspacePane::AssemblyView => "3D View",
+            WorkspacePane::Inspector => "インスペクタ",
         }
         .into()
     }
@@ -327,6 +355,38 @@ enum PieceTool {
     Eraser,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum NewPiecePlane {
+    #[default]
+    Xy,
+    Xz,
+    Yz,
+}
+
+impl NewPiecePlane {
+    const fn plane(self) -> Plane {
+        match self {
+            Self::Xy => Plane::Xy { z: 0 },
+            Self::Xz => Plane::Xz { y: 0 },
+            Self::Yz => Plane::Yz { x: 0 },
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Xy => "XY",
+            Self::Xz => "XZ",
+            Self::Yz => "YZ",
+        }
+    }
+}
+
+#[derive(Default)]
+struct TreeEditorState {
+    new_name: String,
+    new_piece_plane: NewPiecePlane,
+}
+
 struct PieceEditorState {
     piece_id: Option<ObjectId>,
     layout: PlateLayout,
@@ -379,26 +439,169 @@ fn selected_piece_id(selected: Option<ObjectRef>) -> Option<ObjectId> {
     }
 }
 
-fn draw_parts_tree(ui: &mut egui::Ui, project: &Project, selected: &mut Option<ObjectRef>) {
-    for (id, piece) in &project.pieces {
-        if ui
-            .selectable_label(
-                *selected == Some(ObjectRef::Piece(*id)),
-                format!("▦ {} ({} beads)", piece.name, piece.beads.len()),
-            )
-            .clicked()
-        {
-            *selected = Some(ObjectRef::Piece(*id));
+fn draw_parts_tree(
+    ui: &mut egui::Ui,
+    project: &Project,
+    selected: &mut Option<ObjectRef>,
+    state: &mut TreeEditorState,
+    commands: &mut Vec<PendingCommand>,
+) {
+    ui.horizontal(|ui| {
+        ui.label("名前");
+        ui.text_edit_singleline(&mut state.new_name);
+    });
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_id_salt("new-piece-plane")
+            .selected_text(state.new_piece_plane.label())
+            .show_ui(ui, |ui| {
+                for plane in [NewPiecePlane::Xy, NewPiecePlane::Xz, NewPiecePlane::Yz] {
+                    ui.selectable_value(&mut state.new_piece_plane, plane, plane.label());
+                }
+            });
+        let parent_group_id = selected_parent_group(project, *selected);
+        if ui.button("＋Piece").clicked() {
+            let name = non_empty_name(&state.new_name, "Piece", project.pieces.len() + 1);
+            commands.push(PendingCommand {
+                command: Command::CreatePiece {
+                    parent_group_id,
+                    name,
+                    plane: state.new_piece_plane.plane(),
+                },
+                select_created: true,
+            });
+            state.new_name.clear();
         }
-    }
+        if ui.button("＋Group").clicked() {
+            let name = non_empty_name(&state.new_name, "Group", project.groups.len());
+            commands.push(PendingCommand {
+                command: Command::CreateGroup {
+                    parent_group_id,
+                    name,
+                },
+                select_created: true,
+            });
+            state.new_name.clear();
+        }
+    });
+    ui.separator();
+    draw_group_tree(ui, project, project.root_group_id(), selected, commands);
     ui.separator();
     ui.label(format!("総ビーズ数: {}", project.inventory().total));
+}
+
+fn non_empty_name(input: &str, prefix: &str, number: usize) -> String {
+    let input = input.trim();
+    if input.is_empty() {
+        format!("{prefix} {number}")
+    } else {
+        input.to_owned()
+    }
+}
+
+fn selected_parent_group(project: &Project, selected: Option<ObjectRef>) -> ObjectId {
+    match selected {
+        Some(ObjectRef::Group(id)) if project.groups.contains_key(&id) => id,
+        Some(ObjectRef::Piece(id)) => project
+            .pieces
+            .get(&id)
+            .map_or(project.root_group_id(), |piece| piece.parent_group_id),
+        Some(ObjectRef::Shape(id)) => project
+            .shapes
+            .get(&id)
+            .map_or(project.root_group_id(), |shape| shape.parent_group_id),
+        _ => project.root_group_id(),
+    }
+}
+
+fn draw_group_tree(
+    ui: &mut egui::Ui,
+    project: &Project,
+    group_id: ObjectId,
+    selected: &mut Option<ObjectRef>,
+    commands: &mut Vec<PendingCommand>,
+) {
+    let Some(group) = project.groups.get(&group_id) else {
+        return;
+    };
+    draw_object_row(
+        ui,
+        format!("▾ {}", group.name),
+        ObjectRef::Group(group.id),
+        group.visible,
+        selected,
+        commands,
+    );
+    ui.indent(("group-children", group.id), |ui| {
+        for child in project
+            .groups
+            .values()
+            .filter(|child| child.parent_group_id == Some(group.id))
+        {
+            draw_group_tree(ui, project, child.id, selected, commands);
+        }
+        for shape in project
+            .shapes
+            .values()
+            .filter(|shape| shape.parent_group_id == group.id)
+        {
+            draw_object_row(
+                ui,
+                format!("◆ {} ({} beads)", shape.name, shape.beads.len()),
+                ObjectRef::Shape(shape.id),
+                shape.visible,
+                selected,
+                commands,
+            );
+        }
+        for piece in project
+            .pieces
+            .values()
+            .filter(|piece| piece.parent_group_id == group.id)
+        {
+            draw_object_row(
+                ui,
+                format!("▦ {} ({} beads)", piece.name, piece.beads.len()),
+                ObjectRef::Piece(piece.id),
+                piece.visible,
+                selected,
+                commands,
+            );
+        }
+    });
+}
+
+fn draw_object_row(
+    ui: &mut egui::Ui,
+    label: String,
+    object: ObjectRef,
+    visible: bool,
+    selected: &mut Option<ObjectRef>,
+    commands: &mut Vec<PendingCommand>,
+) {
+    ui.horizontal(|ui| {
+        let mut requested_visibility = visible;
+        if ui.checkbox(&mut requested_visibility, "").changed() {
+            commands.push(PendingCommand {
+                command: Command::SetVisibility {
+                    object,
+                    visible: requested_visibility,
+                },
+                select_created: false,
+            });
+        }
+        if ui
+            .selectable_label(*selected == Some(object), label)
+            .clicked()
+        {
+            *selected = Some(object);
+        }
+    });
 }
 fn draw_editor(
     ui: &mut egui::Ui,
     piece: Option<&Piece>,
     state: &mut PieceEditorState,
-    commands: &mut Vec<Command>,
+    commands: &mut Vec<PendingCommand>,
 ) {
     let Some(piece) = piece else {
         state.reset();
@@ -486,23 +689,32 @@ fn draw_editor(
         match (state.tool, existing) {
             (PieceTool::Pencil, None) => {
                 state.layout.expand_to_include(cell);
-                commands.push(Command::AddBead {
-                    target,
-                    bead: Bead {
-                        position,
-                        color: state.color,
+                commands.push(PendingCommand {
+                    command: Command::AddBead {
+                        target,
+                        bead: Bead {
+                            position,
+                            color: state.color,
+                        },
                     },
+                    select_created: false,
                 });
             }
             (PieceTool::Pencil, Some(color)) if color != state.color => {
-                commands.push(Command::RecolorBead {
-                    target,
-                    position,
-                    color: state.color,
+                commands.push(PendingCommand {
+                    command: Command::RecolorBead {
+                        target,
+                        position,
+                        color: state.color,
+                    },
+                    select_created: false,
                 });
             }
             (PieceTool::Eraser, Some(_)) => {
-                commands.push(Command::RemoveBead { target, position });
+                commands.push(PendingCommand {
+                    command: Command::RemoveBead { target, position },
+                    select_created: false,
+                });
             }
             _ => {}
         }
@@ -647,6 +859,68 @@ fn draw_cell_highlight(
         egui::Stroke::new(2.0, egui::Color32::from_rgb(40, 105, 210)),
         egui::StrokeKind::Inside,
     );
+}
+
+fn draw_inspector(ui: &mut egui::Ui, project: &Project, selected: Option<ObjectRef>) {
+    let Some(selected) = selected else {
+        ui.label("ツリーから対象を選択してください");
+        return;
+    };
+    match selected {
+        ObjectRef::Group(id) => {
+            let Some(group) = project.groups.get(&id) else {
+                ui.label("選択したGroupは存在しません");
+                return;
+            };
+            ui.heading(&group.name);
+            ui.label("種類: Group");
+            ui.label(format!("ID: {}", group.id));
+            ui.label(format!("表示: {}", visibility_label(group.visible)));
+            ui.label(format!("配置: {:?}", group.placement.translation));
+        }
+        ObjectRef::Shape(id) => {
+            let Some(shape) = project.shapes.get(&id) else {
+                ui.label("選択したShapeは存在しません");
+                return;
+            };
+            ui.heading(&shape.name);
+            ui.label("種類: Shape");
+            ui.label(format!("ID: {}", shape.id));
+            ui.label(format!("ビーズ数: {}", shape.beads.len()));
+            ui.label(format!("表示: {}", visibility_label(shape.visible)));
+        }
+        ObjectRef::Piece(id) => {
+            let Some(piece) = project.pieces.get(&id) else {
+                ui.label("選択したPieceは存在しません");
+                return;
+            };
+            let layout = PlateLayout::for_piece(piece);
+            ui.heading(&piece.name);
+            ui.label("種類: Piece");
+            ui.label(format!("ID: {}", piece.id));
+            ui.label(format!("平面: {}", plane_label(piece.plane)));
+            ui.label(format!("ビーズ数: {}", piece.beads.len()));
+            ui.label(format!(
+                "最小プレート: {}×{}（{}枚）",
+                layout.columns,
+                layout.rows,
+                layout.columns * layout.rows
+            ));
+            ui.label(format!("表示: {}", visibility_label(piece.visible)));
+        }
+    }
+}
+
+const fn visibility_label(visible: bool) -> &'static str {
+    if visible { "表示" } else { "非表示" }
+}
+
+const fn plane_label(plane: Plane) -> &'static str {
+    match plane {
+        Plane::Xy { .. } => "XY",
+        Plane::Xz { .. } => "XZ",
+        Plane::Yz { .. } => "YZ",
+    }
 }
 
 fn draw_preview(
