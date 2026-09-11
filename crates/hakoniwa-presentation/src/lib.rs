@@ -4,8 +4,8 @@ use eframe::egui;
 use glam::{Quat, Vec3};
 use hakoniwa_application::{Command, Editor, ProjectRepository};
 use hakoniwa_domain::{
-    Bead, Color, GridAxis, GridPosition, ObjectId, ObjectRef, Piece, Placement, Plane, Project,
-    VoxelObjectRef,
+    Bead, Color, GridAxis, GridPosition, GridRotation, ObjectId, ObjectRef, Piece, Placement,
+    Plane, Project, VoxelObjectRef,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -503,6 +503,23 @@ enum TransformShortcut {
     Rotate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveConstraint {
+    ViewPlane,
+    Axis(GridAxis),
+    PlaneExcluding(GridAxis),
+}
+
+#[derive(Clone, Copy)]
+struct MoveSession {
+    object: ObjectRef,
+    start_placement: Placement,
+    preview_placement: Placement,
+    start_pointer: egui::Pos2,
+    constraint: MoveConstraint,
+    camera: Option<Camera>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum TransformTool {
     #[default]
@@ -514,11 +531,14 @@ enum TransformTool {
 struct AssemblyEditorState {
     shortcut: Option<TransformShortcut>,
     tool: TransformTool,
+    move_session: Option<MoveSession>,
+    last_camera: Option<Camera>,
 }
 
 impl AssemblyEditorState {
     fn reset(&mut self) {
         self.shortcut = None;
+        self.move_session = None;
     }
 }
 
@@ -1606,17 +1626,21 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             *context.pan = egui::Vec2::ZERO;
         }
     });
-    if let Some(shortcut) = context.editor.shortcut {
-        let action = match shortcut {
-            TransformShortcut::Move => "移動",
-            TransformShortcut::Rotate => "90°回転",
-        };
+    if let Some(session) = context.editor.move_session {
+        let constraint = move_constraint_label(session.constraint);
         ui.colored_label(
             egui::Color32::from_rgb(210, 105, 15),
-            format!("{action}: X / Y / Zで軸を指定 · Shiftで負方向 · Escで取消"),
+            format!(
+                "移動 ({constraint}): X/Y/Zで軸固定 · Shift+X/Y/Zで軸除外 · 左クリック/Enterで確定 · 右クリック/Escで取消"
+            ),
+        );
+    } else if context.editor.shortcut == Some(TransformShortcut::Rotate) {
+        ui.colored_label(
+            egui::Color32::from_rgb(210, 105, 15),
+            "90°回転: X / Y / Zで軸を指定 · Shiftで負方向 · Escで取消",
         );
     }
-    ui.label("ギズモ軸をクリック: +1マス / +90° · Shift+クリック: 逆方向 · G/R → X/Y/Z");
+    ui.label("ギズモ軸をクリック: +1マス / +90° · G→X/Y/Z: 軸固定 · G→Shift+軸: その軸を除外");
     ui.label("中ホイールドラッグ: Turntable回転 / Shift+中ホイール: 移動 / ホイール: ズーム");
     let (rect, response) =
         ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -1636,12 +1660,26 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             }
         });
     }
+    let pointer = ui
+        .input(|input| input.pointer.hover_pos())
+        .filter(|pointer| rect.contains(*pointer));
+    if let (Some(session), Some(pointer)) = (&mut context.editor.move_session, pointer) {
+        update_move_preview(project, session, pointer, context.editor.last_camera);
+    }
+    let preview_project = context.editor.move_session.map(|session| {
+        let mut preview = project.clone();
+        preview
+            .set_placement(session.object, session.preview_placement)
+            .expect("move preview object must exist");
+        preview
+    });
+    let render_project = preview_project.as_ref().unwrap_or(project);
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
     let rendered = render_voxels(
         &painter,
         rect,
-        project,
+        render_project,
         RenderOptions {
             selected: *context.selected,
             orientation: *context.orientation,
@@ -1650,22 +1688,46 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             perspective: *context.perspective,
         },
     );
-    let gizmo_pointer = ui
-        .input(|input| input.pointer.hover_pos())
-        .filter(|pointer| rect.contains(*pointer));
-    let gizmo_handled = draw_transform_gizmo(GizmoContext {
-        ui,
-        painter: &painter,
-        rect,
-        pointer: gizmo_pointer,
-        project,
-        selected: *context.selected,
-        tool: context.editor.tool,
-        camera: rendered.camera.as_ref(),
-        clicked: response.clicked_by(egui::PointerButton::Primary),
-        commands: context.commands,
-    });
-    if response.clicked_by(egui::PointerButton::Primary)
+    context.editor.last_camera = rendered.camera;
+    let move_was_active = context.editor.move_session.is_some();
+    let confirm_move = move_was_active
+        && (response.clicked_by(egui::PointerButton::Primary)
+            || ui.input(|input| input.key_pressed(egui::Key::Enter)));
+    let cancel_move = move_was_active && response.clicked_by(egui::PointerButton::Secondary);
+    if confirm_move {
+        let session = context
+            .editor
+            .move_session
+            .take()
+            .expect("active move session must exist");
+        context.editor.shortcut = None;
+        if session.preview_placement != session.start_placement {
+            context.commands.push(PendingCommand {
+                command: Command::SetPlacement {
+                    object: session.object,
+                    placement: session.preview_placement,
+                },
+                select_created: false,
+            });
+        }
+    } else if cancel_move {
+        context.editor.reset();
+    }
+    let gizmo_handled = !move_was_active
+        && draw_transform_gizmo(GizmoContext {
+            ui,
+            painter: &painter,
+            rect,
+            pointer,
+            project,
+            selected: *context.selected,
+            tool: context.editor.tool,
+            camera: rendered.camera.as_ref(),
+            clicked: response.clicked_by(egui::PointerButton::Primary),
+            commands: context.commands,
+        });
+    if !move_was_active
+        && response.clicked_by(egui::PointerButton::Primary)
         && !gizmo_handled
         && let Some(pointer) = response.interact_pointer_pos()
     {
@@ -1894,9 +1956,43 @@ fn handle_assembly_shortcuts(
         state.reset();
         return;
     }
-    if ui.input(|input| input.key_pressed(egui::Key::G)) && selected.is_some() {
+    if ui.input(|input| input.key_pressed(egui::Key::G))
+        && let Some(object) = selected
+        && let Some(start_placement) = placement_for_object(project, object)
+        && let Some(start_pointer) = ui.input(|input| input.pointer.hover_pos())
+    {
         state.shortcut = Some(TransformShortcut::Move);
         state.tool = TransformTool::Move;
+        state.move_session = Some(MoveSession {
+            object,
+            start_placement,
+            preview_placement: start_placement,
+            start_pointer,
+            constraint: MoveConstraint::ViewPlane,
+            camera: state.last_camera,
+        });
+        return;
+    }
+    if let Some(session) = &mut state.move_session {
+        let constraint = ui.input(|input| {
+            let axis = if input.key_pressed(egui::Key::X) {
+                Some(GridAxis::X)
+            } else if input.key_pressed(egui::Key::Y) {
+                Some(GridAxis::Y)
+            } else if input.key_pressed(egui::Key::Z) {
+                Some(GridAxis::Z)
+            } else {
+                None
+            }?;
+            Some(if input.modifiers.shift {
+                MoveConstraint::PlaneExcluding(axis)
+            } else {
+                MoveConstraint::Axis(axis)
+            })
+        });
+        if let Some(constraint) = constraint {
+            session.constraint = constraint;
+        }
         return;
     }
     if ui.input(|input| input.key_pressed(egui::Key::R)) && selected.is_some() {
@@ -1931,18 +2027,7 @@ fn handle_assembly_shortcuts(
         1
     };
     let command = match shortcut {
-        TransformShortcut::Move => {
-            let Some(mut placement) = placement_for_object(project, object) else {
-                state.reset();
-                return;
-            };
-            match axis {
-                GridAxis::X => placement.translation.x += direction,
-                GridAxis::Y => placement.translation.y += direction,
-                GridAxis::Z => placement.translation.z += direction,
-            }
-            Command::SetPlacement { object, placement }
-        }
+        TransformShortcut::Move => return,
         TransformShortcut::Rotate => Command::RotateQuarter {
             object,
             axis,
@@ -1954,6 +2039,89 @@ fn handle_assembly_shortcuts(
         select_created: false,
     });
     state.reset();
+}
+
+fn update_move_preview(
+    project: &Project,
+    session: &mut MoveSession,
+    pointer: egui::Pos2,
+    fallback_camera: Option<Camera>,
+) {
+    let Some(camera) = session.camera.or(fallback_camera) else {
+        return;
+    };
+    session.camera = Some(camera);
+    let world_delta =
+        constrained_world_delta(&camera, pointer - session.start_pointer, session.constraint);
+    let local_delta = parent_world_rotation(project, session.object)
+        .inverse()
+        .apply(world_delta);
+    session.preview_placement.translation =
+        add_grid_positions(session.start_placement.translation, local_delta);
+}
+
+fn constrained_world_delta(
+    camera: &Camera,
+    screen_delta: egui::Vec2,
+    constraint: MoveConstraint,
+) -> GridPosition {
+    if camera.pixels_per_unit <= f32::EPSILON {
+        return GridPosition::ZERO;
+    }
+    if let MoveConstraint::Axis(axis) = constraint {
+        let projected = camera.orientation * axis_vector(axis);
+        let screen_axis = egui::vec2(projected.x, -projected.y);
+        if screen_axis.length_sq() <= f32::EPSILON {
+            return GridPosition::ZERO;
+        }
+        let steps =
+            (screen_delta.dot(screen_axis.normalized()) / camera.pixels_per_unit).round() as i32;
+        return match axis {
+            GridAxis::X => GridPosition::new(steps, 0, 0),
+            GridAxis::Y => GridPosition::new(0, steps, 0),
+            GridAxis::Z => GridPosition::new(0, 0, steps),
+        };
+    }
+
+    let camera_delta = Vec3::new(screen_delta.x, -screen_delta.y, 0.0) / camera.pixels_per_unit;
+    let mut world_delta = camera.orientation.conjugate() * camera_delta;
+    if let MoveConstraint::PlaneExcluding(axis) = constraint {
+        match axis {
+            GridAxis::X => world_delta.x = 0.0,
+            GridAxis::Y => world_delta.y = 0.0,
+            GridAxis::Z => world_delta.z = 0.0,
+        }
+    }
+    GridPosition::new(
+        world_delta.x.round() as i32,
+        world_delta.y.round() as i32,
+        world_delta.z.round() as i32,
+    )
+}
+
+fn parent_world_rotation(project: &Project, object: ObjectRef) -> GridRotation {
+    let mut parent = object_parent_group(project, object);
+    let mut rotation = GridRotation::IDENTITY;
+    while let Some(parent_id) = parent {
+        let Some(group) = project.groups.get(&parent_id) else {
+            break;
+        };
+        rotation = group.placement.rotation.compose(rotation);
+        parent = group.parent_group_id;
+    }
+    rotation
+}
+
+const fn move_constraint_label(constraint: MoveConstraint) -> &'static str {
+    match constraint {
+        MoveConstraint::ViewPlane => "ビュー平面",
+        MoveConstraint::Axis(GridAxis::X) => "X軸",
+        MoveConstraint::Axis(GridAxis::Y) => "Y軸",
+        MoveConstraint::Axis(GridAxis::Z) => "Z軸",
+        MoveConstraint::PlaneExcluding(GridAxis::X) => "YZ平面 / Xを除外",
+        MoveConstraint::PlaneExcluding(GridAxis::Y) => "XZ平面 / Yを除外",
+        MoveConstraint::PlaneExcluding(GridAxis::Z) => "XY平面 / Zを除外",
+    }
 }
 
 fn placement_for_object(project: &Project, object: ObjectRef) -> Option<Placement> {
@@ -2575,6 +2743,54 @@ mod presentation_tests {
         assert_eq!(
             transformed_world_position(&project, group, placement, GridPosition::new(1, 0, 0)),
             GridPosition::new(0, 2, 0)
+        );
+    }
+
+    #[test]
+    fn shifted_axis_constraints_exclude_that_world_axis() {
+        let camera = Camera {
+            orientation: Quat::IDENTITY,
+            target: Vec3::ZERO,
+            pixels_per_unit: 10.0,
+            pan: egui::Vec2::ZERO,
+            perspective: false,
+            focal_distance: 10.0,
+        };
+
+        assert_eq!(
+            constrained_world_delta(
+                &camera,
+                egui::vec2(20.0, -30.0),
+                MoveConstraint::PlaneExcluding(GridAxis::X)
+            ),
+            GridPosition::new(0, 3, 0)
+        );
+        assert_eq!(
+            constrained_world_delta(
+                &camera,
+                egui::vec2(20.0, -30.0),
+                MoveConstraint::PlaneExcluding(GridAxis::Y)
+            ),
+            GridPosition::new(2, 0, 0)
+        );
+    }
+
+    #[test]
+    fn world_move_is_converted_into_parent_local_coordinates() {
+        let mut project = Project::new("move");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "rotated").unwrap();
+        let piece = project
+            .create_piece(group, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+        project.groups.get_mut(&group).unwrap().placement.rotation =
+            GridRotation::IDENTITY.rotate_quarter(GridAxis::Z, 1);
+
+        assert_eq!(
+            parent_world_rotation(&project, ObjectRef::Piece(piece))
+                .inverse()
+                .apply(GridPosition::new(1, 0, 0)),
+            GridPosition::new(0, -1, 0)
         );
     }
 }

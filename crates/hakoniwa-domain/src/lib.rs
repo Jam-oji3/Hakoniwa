@@ -123,7 +123,8 @@ impl GridRotation {
         rows_are_unit && columns_are_unit && self.determinant() == 1
     }
 
-    const fn compose(self, right: Self) -> Self {
+    #[must_use]
+    pub const fn compose(self, right: Self) -> Self {
         let mut matrix = [[0; 3]; 3];
         let mut row = 0;
         while row < 3 {
@@ -139,6 +140,17 @@ impl GridRotation {
             row += 1;
         }
         Self { matrix }
+    }
+
+    #[must_use]
+    pub const fn inverse(self) -> Self {
+        Self {
+            matrix: [
+                [self.matrix[0][0], self.matrix[1][0], self.matrix[2][0]],
+                [self.matrix[0][1], self.matrix[1][1], self.matrix[2][1]],
+                [self.matrix[0][2], self.matrix[1][2], self.matrix[2][2]],
+            ],
+        }
     }
 
     const fn determinant(self) -> i8 {
@@ -1537,6 +1549,16 @@ mod tests {
             }
         }
         assert_eq!(rotations.len(), 24);
+    }
+
+    #[test]
+    fn inverse_rotation_restores_grid_positions() {
+        let rotation = GridRotation::IDENTITY
+            .rotate_quarter(GridAxis::X, 1)
+            .rotate_quarter(GridAxis::Z, 3);
+        let position = GridPosition::new(3, -5, 7);
+
+        assert_eq!(rotation.inverse().apply(rotation.apply(position)), position);
     }
 
     #[test]
