@@ -463,7 +463,13 @@ struct TreeEditorState {
     rename_buffer: String,
     focus_rename: bool,
     dragged: Option<ObjectRef>,
-    drop_target: Option<ObjectId>,
+    drop_target: Option<TreeDropTarget>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TreeDropTarget {
+    IntoGroup(ObjectId),
+    After(ObjectRef),
 }
 
 impl TreeEditorState {
@@ -595,16 +601,25 @@ fn draw_parts_tree(
         draw_tree_drag_ghost(ui, project, object);
     }
     if ui.input(|input| input.pointer.any_released()) {
-        if let (Some(object), Some(target)) = (state.dragged, state.drop_target)
-            && can_reparent(project, object, target)
-        {
-            commands.push(PendingCommand {
-                command: Command::ReparentObject {
-                    object,
-                    new_parent_group_id: target,
-                },
-                select_created: false,
-            });
+        if let (Some(object), Some(target)) = (state.dragged, state.drop_target) {
+            let command = match target {
+                TreeDropTarget::IntoGroup(group_id) if can_reparent(project, object, group_id) => {
+                    Some(Command::ReparentObject {
+                        object,
+                        new_parent_group_id: group_id,
+                    })
+                }
+                TreeDropTarget::After(target) if can_move_after(project, object, target) => {
+                    Some(Command::MoveObjectAfter { object, target })
+                }
+                _ => None,
+            };
+            if let Some(command) = command {
+                commands.push(PendingCommand {
+                    command,
+                    select_created: false,
+                });
+            }
         }
         state.dragged = None;
         state.drop_target = None;
@@ -736,48 +751,42 @@ fn draw_group_tree(
         },
     );
     ui.indent(("group-children", group.id), |ui| {
-        for child in project
-            .groups
-            .values()
-            .filter(|child| child.parent_group_id == Some(group.id))
-        {
-            draw_group_tree(ui, project, child.id, selected, state, commands);
-        }
-        for shape in project
-            .shapes
-            .values()
-            .filter(|shape| shape.parent_group_id == group.id)
-        {
-            draw_object_row(
-                ui,
-                &format!("{} ({} beads)", shape.name, shape.beads.len()),
-                ObjectRef::Shape(shape.id),
-                shape.visible,
-                &mut TreeRowContext {
-                    project,
-                    selected,
-                    state,
-                    commands,
-                },
-            );
-        }
-        for piece in project
-            .pieces
-            .values()
-            .filter(|piece| piece.parent_group_id == group.id)
-        {
-            draw_object_row(
-                ui,
-                &format!("{} ({} beads)", piece.name, piece.beads.len()),
-                ObjectRef::Piece(piece.id),
-                piece.visible,
-                &mut TreeRowContext {
-                    project,
-                    selected,
-                    state,
-                    commands,
-                },
-            );
+        for child in project.child_objects(group.id) {
+            match child {
+                ObjectRef::Group(id) => {
+                    draw_group_tree(ui, project, id, selected, state, commands);
+                }
+                ObjectRef::Shape(id) => {
+                    let shape = &project.shapes[&id];
+                    draw_object_row(
+                        ui,
+                        &format!("{} ({} beads)", shape.name, shape.beads.len()),
+                        child,
+                        shape.visible,
+                        &mut TreeRowContext {
+                            project,
+                            selected,
+                            state,
+                            commands,
+                        },
+                    );
+                }
+                ObjectRef::Piece(id) => {
+                    let piece = &project.pieces[&id];
+                    draw_object_row(
+                        ui,
+                        &format!("{} ({} beads)", piece.name, piece.beads.len()),
+                        child,
+                        piece.visible,
+                        &mut TreeRowContext {
+                            project,
+                            selected,
+                            state,
+                            commands,
+                        },
+                    );
+                }
+            }
         }
     });
 }
@@ -841,8 +850,21 @@ fn draw_object_row(
             row_id.with("main"),
             egui::Sense::click_and_drag(),
         );
-        let valid_drop_target = matches!(object, ObjectRef::Group(id) if context.state.dragged.is_some_and(|dragged| can_reparent(context.project, dragged, id)));
-        let background = if valid_drop_target && response.contains_pointer() {
+        let hovered_drop_target = context.state.dragged.and_then(|dragged| {
+            let pointer = response.hover_pos()?;
+            if pointer.y >= main_rect.bottom() - 7.0
+                && can_move_after(context.project, dragged, object)
+            {
+                Some(TreeDropTarget::After(object))
+            } else if let ObjectRef::Group(id) = object
+                && can_reparent(context.project, dragged, id)
+            {
+                Some(TreeDropTarget::IntoGroup(id))
+            } else {
+                None
+            }
+        });
+        let background = if matches!(hovered_drop_target, Some(TreeDropTarget::IntoGroup(_))) {
             egui::Color32::from_rgb(190, 215, 245)
         } else if *context.selected == Some(object) {
             egui::Color32::from_rgb(205, 225, 248)
@@ -860,6 +882,15 @@ fn draw_object_row(
             egui::FontId::proportional(14.0),
             ui.visuals().text_color(),
         );
+        if matches!(hovered_drop_target, Some(TreeDropTarget::After(_))) {
+            ui.painter().line_segment(
+                [
+                    egui::pos2(main_rect.left() + 2.0, main_rect.bottom() - 1.0),
+                    egui::pos2(main_rect.right() - 2.0, main_rect.bottom() - 1.0),
+                ],
+                egui::Stroke::new(3.0, egui::Color32::from_rgb(55, 120, 205)),
+            );
+        }
 
         if response.clicked() {
             *context.selected = Some(object);
@@ -868,11 +899,8 @@ fn draw_object_row(
             *context.selected = Some(object);
             context.state.dragged = Some(object);
         }
-        if valid_drop_target
-            && response.contains_pointer()
-            && let ObjectRef::Group(id) = object
-        {
-            context.state.drop_target = Some(id);
+        if let Some(target) = hovered_drop_target {
+            context.state.drop_target = Some(target);
         }
         response.context_menu(|ui| {
             if ui.button("名前を変更    F2").clicked() {
@@ -993,6 +1021,35 @@ fn can_reparent(project: &Project, object: ObjectRef, target_group_id: ObjectId)
                 return false;
             }
             let mut ancestor = Some(target_group_id);
+            while let Some(group_id) = ancestor {
+                if group_id == id {
+                    return false;
+                }
+                ancestor = project
+                    .groups
+                    .get(&group_id)
+                    .and_then(|group| group.parent_group_id);
+            }
+            true
+        }
+        ObjectRef::Shape(id) => project.shapes.contains_key(&id),
+        ObjectRef::Piece(id) => project.pieces.contains_key(&id),
+    }
+}
+
+fn can_move_after(project: &Project, object: ObjectRef, target: ObjectRef) -> bool {
+    if object == target {
+        return false;
+    }
+    let Some(target_parent) = object_parent_group(project, target) else {
+        return false;
+    };
+    match object {
+        ObjectRef::Group(id) => {
+            if id == project.root_group_id() || !project.groups.contains_key(&id) {
+                return false;
+            }
+            let mut ancestor = Some(target_parent);
             while let Some(group_id) = ancestor {
                 if group_id == id {
                     return false;
@@ -1777,6 +1834,21 @@ mod presentation_tests {
         assert!(!can_reparent(&project, ObjectRef::Piece(piece), root));
         assert!(!can_reparent(&project, ObjectRef::Group(parent), child));
         assert!(!can_reparent(&project, ObjectRef::Group(root), child));
+        assert!(can_move_after(
+            &project,
+            ObjectRef::Piece(piece),
+            ObjectRef::Group(parent)
+        ));
+        assert!(!can_move_after(
+            &project,
+            ObjectRef::Group(parent),
+            ObjectRef::Group(child)
+        ));
+        assert!(!can_move_after(
+            &project,
+            ObjectRef::Group(root),
+            ObjectRef::Piece(piece)
+        ));
     }
 
     #[test]

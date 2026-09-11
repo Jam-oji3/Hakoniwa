@@ -70,6 +70,10 @@ pub enum Command {
         object: ObjectRef,
         new_parent_group_id: ObjectId,
     },
+    MoveObjectAfter {
+        object: ObjectRef,
+        target: ObjectRef,
+    },
     ConvertPlaneToPiece {
         shape_id: ObjectId,
         plane: Plane,
@@ -288,6 +292,11 @@ fn apply_command(project: &mut Project, command: Command) -> Result<CommandResul
         } => {
             record_affected_pieces(project, object, &mut result.changes);
             project.reparent_object(object, new_parent_group_id)?;
+            record_object(&mut result.changes, object);
+        }
+        Command::MoveObjectAfter { object, target } => {
+            record_affected_pieces(project, object, &mut result.changes);
+            project.move_object_after(object, target)?;
             record_object(&mut result.changes, object);
         }
         Command::ConvertPlaneToPiece {
@@ -568,6 +577,40 @@ mod tests {
             Some(ObjectRef::Piece(
                 after.pieces.keys().next().copied().unwrap()
             ))
+        );
+    }
+
+    #[test]
+    fn moving_a_tree_object_is_undoable() {
+        let mut project = Project::new("tree order");
+        let root = project.root_group_id();
+        let first = project
+            .create_piece(root, "first", Plane::Xy { z: 0 })
+            .unwrap();
+        let second = project
+            .create_piece(root, "second", Plane::Xy { z: 0 })
+            .unwrap();
+        let mut editor = Editor::new(project);
+
+        editor
+            .execute(Command::MoveObjectAfter {
+                object: ObjectRef::Piece(first),
+                target: ObjectRef::Piece(second),
+            })
+            .unwrap();
+        assert_eq!(
+            editor.project().child_objects(root),
+            vec![ObjectRef::Piece(second), ObjectRef::Piece(first)]
+        );
+        assert!(editor.undo());
+        assert_eq!(
+            editor.project().child_objects(root),
+            vec![ObjectRef::Piece(first), ObjectRef::Piece(second)]
+        );
+        assert!(editor.redo());
+        assert_eq!(
+            editor.project().child_objects(root),
+            vec![ObjectRef::Piece(second), ObjectRef::Piece(first)]
         );
     }
 

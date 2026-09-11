@@ -154,6 +154,8 @@ pub struct Group {
     pub id: ObjectId,
     pub name: String,
     pub parent_group_id: Option<ObjectId>,
+    #[serde(default)]
+    pub sibling_order: u64,
     pub placement: Placement,
     pub visible: bool,
 }
@@ -163,6 +165,8 @@ pub struct Shape {
     pub id: ObjectId,
     pub name: String,
     pub parent_group_id: ObjectId,
+    #[serde(default)]
+    pub sibling_order: u64,
     pub placement: Placement,
     pub visible: bool,
     pub beads: BTreeMap<GridPosition, Color>,
@@ -173,6 +177,8 @@ pub struct Piece {
     pub id: ObjectId,
     pub name: String,
     pub parent_group_id: ObjectId,
+    #[serde(default)]
+    pub sibling_order: u64,
     pub placement: Placement,
     pub visible: bool,
     pub plane: Plane,
@@ -200,6 +206,7 @@ impl Piece {
             id,
             name: name.into(),
             parent_group_id,
+            sibling_order: 0,
             placement: Placement {
                 orientation: plane.orientation(),
                 ..Placement::default()
@@ -293,6 +300,7 @@ impl Project {
                     id: root_group_id,
                     name: "Root".to_owned(),
                     parent_group_id: None,
+                    sibling_order: 0,
                     placement: Placement::default(),
                     visible: true,
                 },
@@ -315,6 +323,7 @@ impl Project {
         name: impl Into<String>,
     ) -> Result<ObjectId, DomainError> {
         self.require_group(parent_group_id)?;
+        let sibling_order = self.next_sibling_order(parent_group_id);
         let id = self.allocate_id();
         self.groups.insert(
             id,
@@ -322,6 +331,7 @@ impl Project {
                 id,
                 name: name.into(),
                 parent_group_id: Some(parent_group_id),
+                sibling_order,
                 placement: Placement::default(),
                 visible: true,
             },
@@ -341,6 +351,7 @@ impl Project {
         name: impl Into<String>,
     ) -> Result<ObjectId, DomainError> {
         self.require_group(parent_group_id)?;
+        let sibling_order = self.next_sibling_order(parent_group_id);
         let id = self.allocate_id();
         self.shapes.insert(
             id,
@@ -348,6 +359,7 @@ impl Project {
                 id,
                 name: name.into(),
                 parent_group_id,
+                sibling_order,
                 placement: Placement::default(),
                 visible: true,
                 beads: BTreeMap::new(),
@@ -363,11 +375,11 @@ impl Project {
         plane: Plane,
     ) -> Result<ObjectId, DomainError> {
         self.require_group(parent_group_id)?;
+        let sibling_order = self.next_sibling_order(parent_group_id);
         let id = self.allocate_id();
-        self.pieces.insert(
-            id,
-            Piece::new_in_group(id, name, parent_group_id, plane, [])?,
-        );
+        let mut piece = Piece::new_in_group(id, name, parent_group_id, plane, [])?;
+        piece.sibling_order = sibling_order;
+        self.pieces.insert(id, piece);
         Ok(id)
     }
 
@@ -625,6 +637,8 @@ impl Project {
         new_parent_group_id: ObjectId,
     ) -> Result<(), DomainError> {
         self.require_group(new_parent_group_id)?;
+        let parent_changed = self.object_parent_group(object)? != Some(new_parent_group_id);
+        let sibling_order = self.next_sibling_order(new_parent_group_id);
         match object {
             ObjectRef::Group(id) => {
                 if id == self.root_group_id() {
@@ -645,19 +659,83 @@ impl Project {
                     .get_mut(&id)
                     .ok_or(DomainError::GroupNotFound(id))?
                     .parent_group_id = Some(new_parent_group_id);
+                if parent_changed {
+                    self.groups
+                        .get_mut(&id)
+                        .ok_or(DomainError::GroupNotFound(id))?
+                        .sibling_order = sibling_order;
+                }
             }
             ObjectRef::Shape(id) => {
-                self.shapes
+                let shape = self
+                    .shapes
                     .get_mut(&id)
-                    .ok_or(DomainError::ShapeNotFound(id))?
-                    .parent_group_id = new_parent_group_id;
+                    .ok_or(DomainError::ShapeNotFound(id))?;
+                shape.parent_group_id = new_parent_group_id;
+                if parent_changed {
+                    shape.sibling_order = sibling_order;
+                }
             }
             ObjectRef::Piece(id) => {
-                self.pieces
+                let piece = self
+                    .pieces
                     .get_mut(&id)
-                    .ok_or(DomainError::PieceNotFound(id))?
-                    .parent_group_id = new_parent_group_id;
+                    .ok_or(DomainError::PieceNotFound(id))?;
+                piece.parent_group_id = new_parent_group_id;
+                if parent_changed {
+                    piece.sibling_order = sibling_order;
+                }
             }
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn child_objects(&self, parent_group_id: ObjectId) -> Vec<ObjectRef> {
+        let mut children = self
+            .groups
+            .values()
+            .filter(|group| group.parent_group_id == Some(parent_group_id))
+            .map(|group| (group.sibling_order, group.id, ObjectRef::Group(group.id)))
+            .chain(
+                self.shapes
+                    .values()
+                    .filter(|shape| shape.parent_group_id == parent_group_id)
+                    .map(|shape| (shape.sibling_order, shape.id, ObjectRef::Shape(shape.id))),
+            )
+            .chain(
+                self.pieces
+                    .values()
+                    .filter(|piece| piece.parent_group_id == parent_group_id)
+                    .map(|piece| (piece.sibling_order, piece.id, ObjectRef::Piece(piece.id))),
+            )
+            .collect::<Vec<_>>();
+        children.sort_by_key(|(order, id, _)| (*order, *id));
+        children.into_iter().map(|(_, _, object)| object).collect()
+    }
+
+    pub fn move_object_after(
+        &mut self,
+        object: ObjectRef,
+        target: ObjectRef,
+    ) -> Result<(), DomainError> {
+        if object == target {
+            return Err(DomainError::InvalidSiblingTarget(target));
+        }
+        let parent_group_id = self
+            .object_parent_group(target)?
+            .ok_or(DomainError::InvalidSiblingTarget(target))?;
+        self.reparent_object(object, parent_group_id)?;
+
+        let mut siblings = self.child_objects(parent_group_id);
+        siblings.retain(|candidate| *candidate != object);
+        let target_index = siblings
+            .iter()
+            .position(|candidate| *candidate == target)
+            .ok_or(DomainError::InvalidSiblingTarget(target))?;
+        siblings.insert(target_index + 1, object);
+        for (index, sibling) in siblings.into_iter().enumerate() {
+            self.set_sibling_order(sibling, index as u64)?;
         }
         Ok(())
     }
@@ -699,6 +777,7 @@ impl Project {
                 color: *color,
             }),
         )?;
+        piece.sibling_order = self.next_sibling_order(parent_group_id);
         piece.placement = placement;
         piece.placement.orientation = plane.orientation();
         piece.visible = visible;
@@ -839,6 +918,7 @@ impl Project {
                     id: root_group_id,
                     name: "Root".to_owned(),
                     parent_group_id: None,
+                    sibling_order: 0,
                     placement: Placement::default(),
                     visible: true,
                 },
@@ -852,6 +932,7 @@ impl Project {
                             id,
                             name,
                             parent_group_id: root_group_id,
+                            sibling_order: id,
                             placement: Placement::default(),
                             visible: true,
                             beads,
@@ -868,6 +949,7 @@ impl Project {
                             id,
                             name,
                             parent_group_id: root_group_id,
+                            sibling_order: id,
                             placement: Placement {
                                 orientation: plane.orientation(),
                                 ..Placement::default()
@@ -919,6 +1001,66 @@ impl Project {
         }
     }
 
+    fn object_parent_group(&self, object: ObjectRef) -> Result<Option<ObjectId>, DomainError> {
+        match object {
+            ObjectRef::Group(id) => self
+                .groups
+                .get(&id)
+                .map(|group| group.parent_group_id)
+                .ok_or(DomainError::GroupNotFound(id)),
+            ObjectRef::Shape(id) => self
+                .shapes
+                .get(&id)
+                .map(|shape| Some(shape.parent_group_id))
+                .ok_or(DomainError::ShapeNotFound(id)),
+            ObjectRef::Piece(id) => self
+                .pieces
+                .get(&id)
+                .map(|piece| Some(piece.parent_group_id))
+                .ok_or(DomainError::PieceNotFound(id)),
+        }
+    }
+
+    fn next_sibling_order(&self, parent_group_id: ObjectId) -> u64 {
+        self.child_objects(parent_group_id)
+            .into_iter()
+            .filter_map(|object| match object {
+                ObjectRef::Group(id) => self.groups.get(&id).map(|group| group.sibling_order),
+                ObjectRef::Shape(id) => self.shapes.get(&id).map(|shape| shape.sibling_order),
+                ObjectRef::Piece(id) => self.pieces.get(&id).map(|piece| piece.sibling_order),
+            })
+            .max()
+            .map_or(0, |order| order.saturating_add(1))
+    }
+
+    fn set_sibling_order(
+        &mut self,
+        object: ObjectRef,
+        sibling_order: u64,
+    ) -> Result<(), DomainError> {
+        match object {
+            ObjectRef::Group(id) => {
+                self.groups
+                    .get_mut(&id)
+                    .ok_or(DomainError::GroupNotFound(id))?
+                    .sibling_order = sibling_order;
+            }
+            ObjectRef::Shape(id) => {
+                self.shapes
+                    .get_mut(&id)
+                    .ok_or(DomainError::ShapeNotFound(id))?
+                    .sibling_order = sibling_order;
+            }
+            ObjectRef::Piece(id) => {
+                self.pieces
+                    .get_mut(&id)
+                    .ok_or(DomainError::PieceNotFound(id))?
+                    .sibling_order = sibling_order;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_map_id(&self, key: ObjectId, actual: ObjectId) -> Result<(), DomainError> {
         if key == actual {
             Ok(())
@@ -958,6 +1100,7 @@ pub enum DomainError {
     },
     CannotDeleteRootGroup,
     CannotReparentRootGroup,
+    InvalidSiblingTarget(ObjectRef),
     GroupIsNotEmpty(ObjectId),
     HierarchyCycle(ObjectId),
     InvalidRootGroup(ObjectId),
@@ -1165,5 +1308,60 @@ mod tests {
             Err(DomainError::HierarchyCycle(parent))
         );
         assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn sibling_order_can_move_objects_after_mixed_object_types() {
+        let mut project = Project::new("ordered");
+        let root = project.root_group_id();
+        let piece = project
+            .create_piece(root, "piece", Plane::Xy { z: 0 })
+            .unwrap();
+        let group = project.create_group(root, "group").unwrap();
+        let shape = project.create_shape_in_group(root, "shape").unwrap();
+        assert_eq!(
+            project.child_objects(root),
+            vec![
+                ObjectRef::Piece(piece),
+                ObjectRef::Group(group),
+                ObjectRef::Shape(shape),
+            ]
+        );
+
+        project
+            .move_object_after(ObjectRef::Piece(piece), ObjectRef::Shape(shape))
+            .unwrap();
+        assert_eq!(
+            project.child_objects(root),
+            vec![
+                ObjectRef::Group(group),
+                ObjectRef::Shape(shape),
+                ObjectRef::Piece(piece),
+            ]
+        );
+    }
+
+    #[test]
+    fn moving_after_an_object_in_another_group_reparents_it() {
+        let mut project = Project::new("ordered");
+        let root = project.root_group_id();
+        let left = project.create_group(root, "left").unwrap();
+        let right = project.create_group(root, "right").unwrap();
+        let moving = project
+            .create_piece(left, "moving", Plane::Xy { z: 0 })
+            .unwrap();
+        let target = project
+            .create_piece(right, "target", Plane::Xy { z: 0 })
+            .unwrap();
+
+        project
+            .move_object_after(ObjectRef::Piece(moving), ObjectRef::Piece(target))
+            .unwrap();
+        assert!(project.child_objects(left).is_empty());
+        assert_eq!(
+            project.child_objects(right),
+            vec![ObjectRef::Piece(target), ObjectRef::Piece(moving)]
+        );
+        assert_eq!(project.pieces[&moving].parent_group_id, right);
     }
 }

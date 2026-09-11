@@ -27,8 +27,8 @@
 
 - Project名と次に発行する安定ID
 - AssemblyのID・名称・Root Group ID
-- GroupのID・名称・親Group・配置・表示状態
-- Shape/PieceのID・名称・親Group・配置・表示状態
+- GroupのID・名称・親Group・同階層での表示順・配置・表示状態
+- Shape/PieceのID・名称・親Group・同階層での表示順・配置・表示状態
 - 全Beadの格子座標とRGB色
 - Pieceのローカル平面
 - PDF用紙と組立ガイド有無を含む出力設定
@@ -54,6 +54,7 @@
         "id": 2,
         "name": "Root",
         "parent_group_id": null,
+        "sibling_order": 0,
         "placement": {
           "translation": "0,0,0",
           "orientation": "Xy"
@@ -91,6 +92,7 @@
         "id": 2,
         "name": "Root",
         "parent_group_id": null,
+        "sibling_order": 0,
         "placement": {
           "translation": "0,0,0",
           "orientation": "Xy"
@@ -104,6 +106,7 @@
         "id": 3,
         "name": "head",
         "parent_group_id": 2,
+        "sibling_order": 0,
         "placement": {
           "translation": "0,0,0",
           "orientation": "Xy"
@@ -118,6 +121,7 @@
         "id": 4,
         "name": "handle",
         "parent_group_id": 2,
+        "sibling_order": 1,
         "placement": {
           "translation": "0,0,0",
           "orientation": "Xz"
