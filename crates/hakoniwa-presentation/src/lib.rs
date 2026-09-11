@@ -75,16 +75,17 @@ impl<R: ProjectRepository> HakoniwaApp<R> {
         ctx.set_fonts(fonts);
         ctx.set_visuals(egui::Visuals::light());
         let (workspace, pane_ids) = create_workspace_tree();
+        let (project, status) = startup_hammer_project(&repository);
         Self {
-            editor: Editor::new(hammer_project()),
+            editor: Editor::new(project),
             repository,
-            file_path: "hakoniwa.ibcad".into(),
+            file_path: "hammer_complex.ibcad".into(),
             selected: None,
             piece_editor: PieceEditorState::default(),
             tree_editor: TreeEditorState::default(),
             assembly_editor: AssemblyEditorState::default(),
             render_adapter: AssemblyRenderAdapter::default(),
-            status: "ハンマーのMVPサンプルを読み込みました".into(),
+            status,
             zoom: 1.0,
             orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
                 * Quat::from_rotation_z(45.0_f32.to_radians()),
@@ -95,6 +96,31 @@ impl<R: ProjectRepository> HakoniwaApp<R> {
         }
     }
 }
+
+fn startup_hammer_project<R: ProjectRepository>(repository: &R) -> (Project, String) {
+    let working_path = PathBuf::from("hammer_complex.ibcad");
+    if let Ok(project) = repository.load(&working_path) {
+        return (
+            project,
+            format!("読み込みました: {}", working_path.display()),
+        );
+    }
+
+    let benchmark_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../fixtures/benchmarks/hammer_complex.ibcad");
+    if let Ok(project) = repository.load(&benchmark_path) {
+        return (
+            project,
+            "複雑なハンマーのベンチマークをテンプレートとして読み込みました".into(),
+        );
+    }
+
+    (
+        hammer_project(),
+        "複雑なハンマーを読み込めなかったため、簡易サンプルを作成しました".into(),
+    )
+}
+
 fn hammer_project() -> Project {
     let mut project = Project::new("ハンマー");
     let head = project.create_shape("頭部");
