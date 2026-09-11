@@ -233,6 +233,29 @@ pub enum ObjectRef {
     Piece(ObjectId),
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObjectClipboard {
+    Group {
+        name: String,
+        placement: Placement,
+        visible: bool,
+        children: Vec<ObjectClipboard>,
+    },
+    Shape {
+        name: String,
+        placement: Placement,
+        visible: bool,
+        beads: BTreeMap<GridPosition, Color>,
+    },
+    Piece {
+        name: String,
+        placement: Placement,
+        visible: bool,
+        plane: Plane,
+        beads: BTreeMap<GridPosition, Color>,
+    },
+}
+
 impl ObjectRef {
     #[must_use]
     pub const fn id(self) -> ObjectId {
@@ -496,6 +519,129 @@ impl Project {
         piece.sibling_order = sibling_order;
         self.pieces.insert(id, piece);
         Ok(id)
+    }
+
+    pub fn copy_object(&self, object: ObjectRef) -> Result<ObjectClipboard, DomainError> {
+        if object == ObjectRef::Group(self.root_group_id()) {
+            return Err(DomainError::CannotCopyRootGroup);
+        }
+        self.copy_object_recursive(object)
+    }
+
+    fn copy_object_recursive(&self, object: ObjectRef) -> Result<ObjectClipboard, DomainError> {
+        match object {
+            ObjectRef::Group(id) => {
+                let group = self.groups.get(&id).ok_or(DomainError::GroupNotFound(id))?;
+                let children = self
+                    .child_objects(id)
+                    .into_iter()
+                    .map(|child| self.copy_object_recursive(child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(ObjectClipboard::Group {
+                    name: group.name.clone(),
+                    placement: group.placement,
+                    visible: group.visible,
+                    children,
+                })
+            }
+            ObjectRef::Shape(id) => {
+                let shape = self.shapes.get(&id).ok_or(DomainError::ShapeNotFound(id))?;
+                Ok(ObjectClipboard::Shape {
+                    name: shape.name.clone(),
+                    placement: shape.placement,
+                    visible: shape.visible,
+                    beads: shape.beads.clone(),
+                })
+            }
+            ObjectRef::Piece(id) => {
+                let piece = self.pieces.get(&id).ok_or(DomainError::PieceNotFound(id))?;
+                Ok(ObjectClipboard::Piece {
+                    name: piece.name.clone(),
+                    placement: piece.placement,
+                    visible: piece.visible,
+                    plane: piece.plane,
+                    beads: piece.beads.clone(),
+                })
+            }
+        }
+    }
+
+    pub fn paste_object(
+        &mut self,
+        parent_group_id: ObjectId,
+        clipboard: &ObjectClipboard,
+    ) -> Result<ObjectRef, DomainError> {
+        self.require_group(parent_group_id)?;
+        self.paste_object_recursive(parent_group_id, clipboard, true)
+    }
+
+    fn paste_object_recursive(
+        &mut self,
+        parent_group_id: ObjectId,
+        clipboard: &ObjectClipboard,
+        rename_copy: bool,
+    ) -> Result<ObjectRef, DomainError> {
+        match clipboard {
+            ObjectClipboard::Group {
+                name,
+                placement,
+                visible,
+                children,
+            } => {
+                let id =
+                    self.create_group(parent_group_id, copied_object_name(name, rename_copy))?;
+                let group = self
+                    .groups
+                    .get_mut(&id)
+                    .expect("a newly created group always exists");
+                group.placement = *placement;
+                group.visible = *visible;
+                for child in children {
+                    self.paste_object_recursive(id, child, false)?;
+                }
+                Ok(ObjectRef::Group(id))
+            }
+            ObjectClipboard::Shape {
+                name,
+                placement,
+                visible,
+                beads,
+            } => {
+                let id = self.create_shape_in_group(
+                    parent_group_id,
+                    copied_object_name(name, rename_copy),
+                )?;
+                let shape = self
+                    .shapes
+                    .get_mut(&id)
+                    .expect("a newly created shape always exists");
+                shape.placement = *placement;
+                shape.visible = *visible;
+                shape.beads.clone_from(beads);
+                Ok(ObjectRef::Shape(id))
+            }
+            ObjectClipboard::Piece {
+                name,
+                placement,
+                visible,
+                plane,
+                beads,
+            } => {
+                let id = self.create_piece(
+                    parent_group_id,
+                    copied_object_name(name, rename_copy),
+                    *plane,
+                )?;
+                let piece = self
+                    .pieces
+                    .get_mut(&id)
+                    .expect("a newly created piece always exists");
+                piece.placement = *placement;
+                piece.visible = *visible;
+                piece.beads.clone_from(beads);
+                Ok(ObjectRef::Piece(id))
+            }
+        }
     }
 
     pub fn delete_object(&mut self, object: ObjectRef) -> Result<(), DomainError> {
@@ -1320,6 +1466,14 @@ impl Project {
     }
 }
 
+fn copied_object_name(name: &str, rename_copy: bool) -> String {
+    if rename_copy {
+        format!("{name} copy")
+    } else {
+        name.to_owned()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DomainError {
     AssemblyNotFound(ObjectId),
@@ -1343,6 +1497,7 @@ pub enum DomainError {
         plane: Plane,
     },
     CannotDeleteRootGroup,
+    CannotCopyRootGroup,
     CannotReparentRootGroup,
     InvalidSiblingTarget(ObjectRef),
     InvalidGridRotation(ObjectRef),
@@ -1689,5 +1844,92 @@ mod tests {
             GridRotation::IDENTITY
         );
         assert!(loaded.validate().is_ok());
+    }
+
+    #[test]
+    fn copied_piece_can_be_pasted_after_the_source_is_deleted() {
+        let mut project = Project::new("clipboard");
+        let root = project.root_group_id();
+        let piece = project
+            .create_piece(root, "handle", Plane::Xy { z: 0 })
+            .unwrap();
+        project
+            .add_bead(
+                VoxelObjectRef::Piece(piece),
+                Bead {
+                    position: GridPosition::new(2, 3, 0),
+                    color: Color::BROWN,
+                },
+            )
+            .unwrap();
+        project
+            .pieces
+            .get_mut(&piece)
+            .unwrap()
+            .placement
+            .translation = GridPosition::new(4, 5, 6);
+
+        let clipboard = project.copy_object(ObjectRef::Piece(piece)).unwrap();
+        project.delete_object(ObjectRef::Piece(piece)).unwrap();
+        let pasted = project.paste_object(root, &clipboard).unwrap();
+        let ObjectRef::Piece(pasted_id) = pasted else {
+            panic!("expected a pasted piece");
+        };
+
+        let pasted_piece = &project.pieces[&pasted_id];
+        assert_eq!(pasted_piece.name, "handle copy");
+        assert_eq!(
+            pasted_piece.placement.translation,
+            GridPosition::new(4, 5, 6)
+        );
+        assert_eq!(pasted_piece.beads.len(), 1);
+        assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn pasted_group_preserves_its_complete_subtree() {
+        let mut project = Project::new("clipboard tree");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "head").unwrap();
+        let child_group = project.create_group(group, "inner").unwrap();
+        let piece = project
+            .create_piece(child_group, "face", Plane::Xy { z: 0 })
+            .unwrap();
+        project
+            .add_bead(
+                VoxelObjectRef::Piece(piece),
+                Bead {
+                    position: GridPosition::ZERO,
+                    color: Color::RED,
+                },
+            )
+            .unwrap();
+
+        let clipboard = project.copy_object(ObjectRef::Group(group)).unwrap();
+        let pasted = project.paste_object(root, &clipboard).unwrap();
+        let ObjectRef::Group(pasted_group) = pasted else {
+            panic!("expected a pasted group");
+        };
+        let pasted_children = project.child_objects(pasted_group);
+        let ObjectRef::Group(pasted_child_group) = pasted_children[0] else {
+            panic!("expected the nested group");
+        };
+        let pasted_grandchildren = project.child_objects(pasted_child_group);
+
+        assert_eq!(project.groups[&pasted_group].name, "head copy");
+        assert_eq!(project.groups[&pasted_child_group].name, "inner");
+        assert_eq!(pasted_grandchildren.len(), 1);
+        assert!(matches!(pasted_grandchildren[0], ObjectRef::Piece(_)));
+        assert_eq!(project.pieces.len(), 2);
+        assert!(project.validate().is_ok());
+    }
+
+    #[test]
+    fn root_group_cannot_be_copied() {
+        let project = Project::new("clipboard");
+        assert_eq!(
+            project.copy_object(ObjectRef::Group(project.root_group_id())),
+            Err(DomainError::CannotCopyRootGroup)
+        );
     }
 }

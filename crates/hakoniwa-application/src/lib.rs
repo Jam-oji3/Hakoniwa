@@ -3,8 +3,8 @@
 use std::{collections::BTreeSet, path::Path};
 
 use hakoniwa_domain::{
-    Bead, Color, DomainError, GridAxis, GridPosition, ObjectId, ObjectRef, OrthogonalOrientation,
-    Placement, Plane, Project, VoxelObjectRef,
+    Bead, Color, DomainError, GridAxis, GridPosition, ObjectClipboard, ObjectId, ObjectRef,
+    OrthogonalOrientation, Placement, Plane, Project, VoxelObjectRef,
 };
 
 pub trait ProjectRepository {
@@ -31,6 +31,10 @@ pub enum Command {
     },
     DeleteObject {
         object: ObjectRef,
+    },
+    PasteObject {
+        parent_group_id: ObjectId,
+        clipboard: ObjectClipboard,
     },
     RenameObject {
         object: ObjectRef,
@@ -252,6 +256,14 @@ fn apply_command(project: &mut Project, command: Command) -> Result<CommandResul
             project.delete_object(object)?;
             record_object(&mut result.changes, object);
         }
+        Command::PasteObject {
+            parent_group_id,
+            clipboard,
+        } => {
+            let object = project.paste_object(parent_group_id, &clipboard)?;
+            record_object_tree(project, object, &mut result.changes);
+            result.created_object = Some(object);
+        }
         Command::RenameObject { object, name } => {
             project.rename_object(object, name)?;
             record_object(&mut result.changes, object);
@@ -379,6 +391,15 @@ fn record_object(changes: &mut ChangeSet, object: ObjectRef) {
     changes.changed_objects.insert(object);
     if let ObjectRef::Piece(id) = object {
         changes.dirty_piece_ids.insert(id);
+    }
+}
+
+fn record_object_tree(project: &Project, object: ObjectRef, changes: &mut ChangeSet) {
+    record_object(changes, object);
+    if let ObjectRef::Group(group_id) = object {
+        for child in project.child_objects(group_id) {
+            record_object_tree(project, child, changes);
+        }
     }
 }
 
@@ -643,6 +664,37 @@ mod tests {
             editor.project().child_objects(root),
             vec![ObjectRef::Piece(second), ObjectRef::Piece(first)]
         );
+    }
+
+    #[test]
+    fn pasting_a_group_tree_is_one_undoable_command() {
+        let mut project = Project::new("clipboard tree");
+        let root = project.root_group_id();
+        let group = project.create_group(root, "head").unwrap();
+        project
+            .create_piece(group, "face", Plane::Xy { z: 0 })
+            .unwrap();
+        let clipboard = project.copy_object(ObjectRef::Group(group)).unwrap();
+        let mut editor = Editor::new(project);
+        let before = editor.project().clone();
+
+        let result = editor
+            .execute(Command::PasteObject {
+                parent_group_id: root,
+                clipboard,
+            })
+            .unwrap();
+        let pasted = result.created_object.unwrap();
+        assert!(matches!(pasted, ObjectRef::Group(_)));
+        assert_eq!(editor.project().groups.len(), 3);
+        assert_eq!(editor.project().pieces.len(), 2);
+        assert_eq!(result.changes.dirty_piece_ids.len(), 1);
+
+        assert!(editor.undo());
+        assert_eq!(editor.project(), &before);
+        assert!(editor.redo());
+        assert_eq!(editor.project().groups.len(), 3);
+        assert_eq!(editor.project().pieces.len(), 2);
     }
 
     #[test]

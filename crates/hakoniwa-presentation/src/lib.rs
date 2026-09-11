@@ -4,8 +4,8 @@ use eframe::egui;
 use glam::{Quat, Vec3};
 use hakoniwa_application::{ChangeSet, Command, Editor, ProjectRepository};
 use hakoniwa_domain::{
-    Bead, Color, GridAxis, GridPosition, GridRotation, ObjectId, ObjectRef, Piece, Placement,
-    Plane, Project, VoxelObjectRef,
+    Bead, Color, GridAxis, GridPosition, GridRotation, ObjectClipboard, ObjectId, ObjectRef, Piece,
+    Placement, Plane, Project, VoxelObjectRef,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -491,6 +491,7 @@ struct TreeEditorState {
     focus_rename: bool,
     dragged: Option<ObjectRef>,
     drop_target: Option<TreeDropTarget>,
+    clipboard: Option<ObjectClipboard>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -803,6 +804,33 @@ fn handle_tree_shortcuts(
     if ui.ctx().egui_wants_keyboard_input() {
         return;
     }
+    let copy_requested = ui.ctx().input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL,
+            egui::Key::C,
+        ))
+    });
+    if copy_requested
+        && let Some(object) = selected
+        && let Ok(clipboard) = project.copy_object(object)
+    {
+        state.clipboard = Some(clipboard);
+    }
+    let paste_requested = ui.ctx().input_mut(|input| {
+        input.consume_shortcut(&egui::KeyboardShortcut::new(
+            egui::Modifiers::CTRL,
+            egui::Key::V,
+        ))
+    });
+    if paste_requested && let Some(clipboard) = state.clipboard.clone() {
+        commands.push(PendingCommand {
+            command: Command::PasteObject {
+                parent_group_id: selected_parent_group(project, selected),
+                clipboard,
+            },
+            select_created: true,
+        });
+    }
     if ui.input(|input| input.key_pressed(egui::Key::F2))
         && let Some(object) = selected
         && let Some(name) = object_name(project, object)
@@ -1017,6 +1045,9 @@ fn draw_object_row(
         if response.clicked() {
             *context.selected = Some(object);
         }
+        if response.secondary_clicked() {
+            *context.selected = Some(object);
+        }
         if response.drag_started() {
             *context.selected = Some(object);
             context.state.dragged = Some(object);
@@ -1029,6 +1060,40 @@ fn draw_object_row(
                 if let Some(name) = object_name(context.project, object) {
                     context.state.start_rename(object, name);
                 }
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(
+                    can_copy(context.project, object),
+                    egui::Button::new("コピー    Ctrl+C"),
+                )
+                .clicked()
+            {
+                if let Ok(clipboard) = context.project.copy_object(object) {
+                    context.state.clipboard = Some(clipboard);
+                }
+                ui.close();
+            }
+            if ui
+                .add_enabled(
+                    context.state.clipboard.is_some(),
+                    egui::Button::new("貼り付け    Ctrl+V"),
+                )
+                .clicked()
+            {
+                let clipboard = context
+                    .state
+                    .clipboard
+                    .clone()
+                    .expect("the paste button is enabled only with clipboard data");
+                context.commands.push(PendingCommand {
+                    command: Command::PasteObject {
+                        parent_group_id: selected_parent_group(context.project, Some(object)),
+                        clipboard,
+                    },
+                    select_created: true,
+                });
                 ui.close();
             }
             if let ObjectRef::Group(parent_group_id) = object {
@@ -1129,6 +1194,10 @@ fn can_delete(project: &Project, object: ObjectRef) -> bool {
         ObjectRef::Shape(id) => project.shapes.contains_key(&id),
         ObjectRef::Piece(id) => project.pieces.contains_key(&id),
     }
+}
+
+fn can_copy(project: &Project, object: ObjectRef) -> bool {
+    object != ObjectRef::Group(project.root_group_id()) && object_name(project, object).is_some()
 }
 
 fn can_reparent(project: &Project, object: ObjectRef, target_group_id: ObjectId) -> bool {
