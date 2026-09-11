@@ -527,6 +527,21 @@ struct MoveSession {
     source: MoveSource,
 }
 
+#[derive(Clone, Copy)]
+struct RotateSession {
+    object: ObjectRef,
+    axis: GridAxis,
+    start_placement: Placement,
+    preview_placement: Placement,
+    start_pointer: egui::Pos2,
+    current_pointer: egui::Pos2,
+    center: egui::Pos2,
+    last_parameter: f32,
+    accumulated_angle: f32,
+    quarter_turns: i8,
+    camera: Camera,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum TransformTool {
     #[default]
@@ -539,6 +554,7 @@ struct AssemblyEditorState {
     shortcut: Option<TransformShortcut>,
     tool: TransformTool,
     move_session: Option<MoveSession>,
+    rotate_session: Option<RotateSession>,
     last_camera: Option<Camera>,
     camera_frame: Option<CameraFrame>,
 }
@@ -547,6 +563,7 @@ impl AssemblyEditorState {
     fn reset(&mut self) {
         self.shortcut = None;
         self.move_session = None;
+        self.rotate_session = None;
     }
 
     fn reset_camera(&mut self) {
@@ -1649,6 +1666,15 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
                 "移動 ({constraint}): X/Y/Zで軸固定 · Shift+X/Y/Zで軸除外 · 左クリック/Enterで確定 · 右クリック/Escで取消"
             ),
         );
+    } else if let Some(session) = context.editor.rotate_session {
+        ui.colored_label(
+            axis_color(session.axis),
+            format!(
+                "{}軸回転: {}° · 左ボタン解放で確定 · 右クリック/Escで取消",
+                axis_label(session.axis),
+                i16::from(session.quarter_turns) * 90
+            ),
+        );
     } else if context.editor.shortcut == Some(TransformShortcut::Rotate) {
         ui.colored_label(
             egui::Color32::from_rgb(210, 105, 15),
@@ -1675,9 +1701,8 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             }
         });
     }
-    let pointer = ui
-        .input(|input| input.pointer.hover_pos())
-        .filter(|pointer| rect.contains(*pointer));
+    let raw_pointer = ui.input(|input| input.pointer.hover_pos());
+    let pointer = raw_pointer.filter(|pointer| rect.contains(*pointer));
     if let (Some(session), Some(pointer)) = (&mut context.editor.move_session, pointer) {
         update_move_preview(
             project,
@@ -1687,11 +1712,24 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             context.editor.last_camera,
         );
     }
-    let preview_project = context.editor.move_session.map(|session| {
+    if let (Some(session), Some(pointer)) = (&mut context.editor.rotate_session, raw_pointer) {
+        update_rotate_preview(session, pointer);
+    }
+    let preview_placement = context
+        .editor
+        .move_session
+        .map(|session| (session.object, session.preview_placement))
+        .or_else(|| {
+            context
+                .editor
+                .rotate_session
+                .map(|session| (session.object, session.preview_placement))
+        });
+    let preview_project = preview_placement.map(|(object, placement)| {
         let mut preview = project.clone();
         preview
-            .set_placement(session.object, session.preview_placement)
-            .expect("move preview object must exist");
+            .set_placement(object, placement)
+            .expect("transform preview object must exist");
         preview
     });
     let render_project = preview_project.as_ref().unwrap_or(project);
@@ -1717,7 +1755,11 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
     if let (Some(session), Some(camera)) = (context.editor.move_session, rendered.camera.as_ref()) {
         draw_move_constraint_guide(&painter, rect, render_project, session, camera);
     }
-    let move_was_active = context.editor.move_session.is_some();
+    if let Some(session) = context.editor.rotate_session {
+        draw_rotation_drag_indicator(&painter, session);
+    }
+    let transform_was_active =
+        context.editor.move_session.is_some() || context.editor.rotate_session.is_some();
     let confirm_move = context
         .editor
         .move_session
@@ -1730,7 +1772,10 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
                 ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary))
             }
         });
-    let cancel_move = move_was_active && response.clicked_by(egui::PointerButton::Secondary);
+    let confirm_rotate = context.editor.rotate_session.is_some()
+        && ui.input(|input| input.pointer.button_released(egui::PointerButton::Primary));
+    let cancel_transform =
+        transform_was_active && response.clicked_by(egui::PointerButton::Secondary);
     if confirm_move {
         let session = context
             .editor
@@ -1747,10 +1792,27 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
                 select_created: false,
             });
         }
-    } else if cancel_move {
+    } else if confirm_rotate {
+        let session = context
+            .editor
+            .rotate_session
+            .take()
+            .expect("active rotate session must exist");
+        context.editor.shortcut = None;
+        if session.quarter_turns != 0 {
+            context.commands.push(PendingCommand {
+                command: Command::RotateQuarter {
+                    object: session.object,
+                    axis: session.axis,
+                    quarter_turns: session.quarter_turns,
+                },
+                select_created: false,
+            });
+        }
+    } else if cancel_transform {
         context.editor.reset();
     }
-    let gizmo_handled = !move_was_active
+    let gizmo_handled = !transform_was_active
         && draw_transform_gizmo(GizmoContext {
             ui,
             painter: &painter,
@@ -1765,7 +1827,7 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             editor: context.editor,
             commands: context.commands,
         });
-    if !move_was_active
+    if !transform_was_active
         && response.clicked_by(egui::PointerButton::Primary)
         && !gizmo_handled
         && let Some(pointer) = response.interact_pointer_pos()
@@ -1789,6 +1851,9 @@ struct GizmoContext<'a> {
     commands: &'a mut Vec<PendingCommand>,
 }
 
+const MOVE_GIZMO_LENGTH: f32 = 64.0;
+const ROTATE_GIZMO_RADIUS: f32 = 48.0;
+
 fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
     let (Some(object), Some(camera)) = (context.selected, context.camera) else {
         return false;
@@ -1803,7 +1868,7 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
             context.pointer.is_some_and(|pointer| {
                 projected_axis_direction(context.rect.center(), camera, origin, *axis).is_some_and(
                     |direction| {
-                        let end = center + direction * 48.0;
+                        let end = center + direction * MOVE_GIZMO_LENGTH;
                         distance_to_segment(pointer, center, end) <= 7.0
                     },
                 )
@@ -1819,7 +1884,12 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
 
     for axis in axes {
         let color = axis_color(axis);
-        let width = if hovered == Some(axis) { 4.0 } else { 2.5 };
+        let width = match context.tool {
+            TransformTool::Move if hovered == Some(axis) => 4.5,
+            TransformTool::Move => 3.0,
+            TransformTool::Rotate if hovered == Some(axis) => 2.75,
+            TransformTool::Rotate => 1.5,
+        };
         match context.tool {
             TransformTool::Move => {
                 let Some(direction) =
@@ -1827,7 +1897,7 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
                 else {
                     continue;
                 };
-                let end = center + direction * 48.0;
+                let end = center + direction * MOVE_GIZMO_LENGTH;
                 context
                     .painter
                     .line_segment([center, end], egui::Stroke::new(width, color));
@@ -1870,6 +1940,33 @@ fn draw_transform_gizmo(context: GizmoContext<'_>) -> bool {
             constraint: MoveConstraint::Axis(axis),
             camera: Some(*camera),
             source: MoveSource::Gizmo,
+        });
+        return true;
+    }
+
+    if context.tool == TransformTool::Rotate
+        && context.drag_started
+        && let Some(axis) = hovered
+        && let Some(start_placement) = placement_for_object(context.project, object)
+        && let Some(start_pointer) = context
+            .ui
+            .input(|input| input.pointer.press_origin())
+            .or(context.pointer)
+    {
+        let parameter = rotation_ring_parameter(center, camera, axis, start_pointer);
+        context.editor.shortcut = Some(TransformShortcut::Rotate);
+        context.editor.rotate_session = Some(RotateSession {
+            object,
+            axis,
+            start_placement,
+            preview_placement: start_placement,
+            start_pointer,
+            current_pointer: start_pointer,
+            center,
+            last_parameter: parameter,
+            accumulated_angle: 0.0,
+            quarter_turns: 0,
+            camera: *camera,
         });
         return true;
     }
@@ -2062,18 +2159,32 @@ fn rotation_ring_points(center: egui::Pos2, camera: &Camera, axis: GridAxis) -> 
         GridAxis::Y => (Vec3::Z, Vec3::X),
         GridAxis::Z => (Vec3::X, Vec3::Y),
     };
-    let mut points = (0..=40)
+    (0..=64)
         .map(|index| {
-            let angle = index as f32 / 40.0 * std::f32::consts::TAU;
+            let angle = index as f32 / 64.0 * std::f32::consts::TAU;
             let camera_point = camera.orientation * (first * angle.cos() + second * angle.sin());
-            center + egui::vec2(camera_point.x, -camera_point.y) * 34.0
+            center + egui::vec2(camera_point.x, -camera_point.y) * ROTATE_GIZMO_RADIUS
         })
-        .collect::<Vec<_>>();
-    if points.len() >= 2 && points[0] == *points.last().unwrap() {
-        points.pop();
-        points.push(points[0]);
-    }
-    points
+        .collect()
+}
+
+fn rotation_ring_parameter(
+    center: egui::Pos2,
+    camera: &Camera,
+    axis: GridAxis,
+    pointer: egui::Pos2,
+) -> f32 {
+    rotation_ring_points(center, camera, axis)
+        .into_iter()
+        .take(64)
+        .enumerate()
+        .min_by(|(_, left), (_, right)| {
+            left.distance_sq(pointer)
+                .total_cmp(&right.distance_sq(pointer))
+        })
+        .map_or(0.0, |(index, _)| {
+            index as f32 / 64.0 * std::f32::consts::TAU
+        })
 }
 
 const fn axis_vector(axis: GridAxis) -> Vec3 {
@@ -2129,6 +2240,9 @@ fn handle_assembly_shortcuts(
     }
     if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
         state.reset();
+        return;
+    }
+    if state.rotate_session.is_some() {
         return;
     }
     if ui.input(|input| input.key_pressed(egui::Key::G))
@@ -2215,6 +2329,52 @@ fn handle_assembly_shortcuts(
         select_created: false,
     });
     state.reset();
+}
+
+fn update_rotate_preview(session: &mut RotateSession, pointer: egui::Pos2) {
+    let parameter = rotation_ring_parameter(session.center, &session.camera, session.axis, pointer);
+    let mut delta = parameter - session.last_parameter;
+    if delta > std::f32::consts::PI {
+        delta -= std::f32::consts::TAU;
+    } else if delta < -std::f32::consts::PI {
+        delta += std::f32::consts::TAU;
+    }
+    session.accumulated_angle += delta;
+    session.last_parameter = parameter;
+    session.current_pointer = pointer;
+    session.quarter_turns = (session.accumulated_angle / std::f32::consts::FRAC_PI_2)
+        .round()
+        .clamp(f32::from(i8::MIN), f32::from(i8::MAX)) as i8;
+    session.preview_placement.rotation = session
+        .start_placement
+        .rotation
+        .rotate_quarter(session.axis, session.quarter_turns);
+}
+
+fn draw_rotation_drag_indicator(painter: &egui::Painter, session: RotateSession) {
+    let color = axis_color(session.axis);
+    let direction = session.current_pointer - session.start_pointer;
+    painter.circle_filled(session.start_pointer, 6.0, color);
+    if direction.length_sq() <= 16.0 {
+        return;
+    }
+    let forward = direction.normalized();
+    let sideways = egui::vec2(-forward.y, forward.x);
+    let tip = session.current_pointer;
+    let arrow_base = tip - forward * 14.0;
+    painter.line_segment(
+        [session.start_pointer, arrow_base],
+        egui::Stroke::new(4.0, color),
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            arrow_base + sideways * 7.0,
+            arrow_base - sideways * 7.0,
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 fn update_move_preview(
@@ -3037,6 +3197,43 @@ mod presentation_tests {
         assert_eq!(
             object_gizmo_center(&project, ObjectRef::Piece(piece)),
             Some(Vec3::new(12.0, -2.0, 1.0))
+        );
+    }
+
+    #[test]
+    fn rotation_drag_snaps_preview_to_quarter_turns() {
+        let camera = Camera {
+            orientation: Quat::IDENTITY,
+            target: Vec3::ZERO,
+            pixels_per_unit: 10.0,
+            pan: egui::Vec2::ZERO,
+            perspective: false,
+            focal_distance: 10.0,
+        };
+        let start = egui::pos2(ROTATE_GIZMO_RADIUS, 0.0);
+        let mut session = RotateSession {
+            object: ObjectRef::Piece(1),
+            axis: GridAxis::Z,
+            start_placement: Placement::default(),
+            preview_placement: Placement::default(),
+            start_pointer: start,
+            current_pointer: start,
+            center: egui::Pos2::ZERO,
+            last_parameter: 0.0,
+            accumulated_angle: 0.0,
+            quarter_turns: 0,
+            camera,
+        };
+
+        update_rotate_preview(&mut session, egui::pos2(0.0, -ROTATE_GIZMO_RADIUS));
+
+        assert_eq!(session.quarter_turns, 1);
+        assert_eq!(
+            session
+                .preview_placement
+                .rotation
+                .apply(GridPosition::new(1, 0, 0)),
+            GridPosition::new(0, 1, 0)
         );
     }
 }
