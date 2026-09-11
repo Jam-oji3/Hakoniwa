@@ -95,6 +95,13 @@ pub struct Editor {
     project: Project,
     undo: Vec<Project>,
     redo: Vec<Project>,
+    transaction: Option<EditTransaction>,
+}
+
+#[derive(Clone, Debug)]
+struct EditTransaction {
+    before: Project,
+    changed: bool,
 }
 
 impl Editor {
@@ -104,6 +111,7 @@ impl Editor {
             project,
             undo: Vec::new(),
             redo: Vec::new(),
+            transaction: None,
         }
     }
 
@@ -114,12 +122,36 @@ impl Editor {
 
     #[must_use]
     pub fn can_undo(&self) -> bool {
-        !self.undo.is_empty()
+        self.transaction
+            .as_ref()
+            .is_some_and(|transaction| transaction.changed)
+            || !self.undo.is_empty()
     }
 
     #[must_use]
     pub fn can_redo(&self) -> bool {
-        !self.redo.is_empty()
+        self.transaction.is_none() && !self.redo.is_empty()
+    }
+
+    pub fn begin_transaction(&mut self) {
+        if self.transaction.is_none() {
+            self.transaction = Some(EditTransaction {
+                before: self.project.clone(),
+                changed: false,
+            });
+        }
+    }
+
+    pub fn end_transaction(&mut self) -> bool {
+        let Some(transaction) = self.transaction.take() else {
+            return false;
+        };
+        if transaction.changed {
+            self.undo.push(transaction.before);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn execute(&mut self, command: Command) -> Result<CommandResult, DomainError> {
@@ -128,12 +160,18 @@ impl Editor {
         let result = apply_command(&mut candidate, command)?;
         candidate.validate()?;
         self.project = candidate;
-        self.undo.push(before);
-        self.redo.clear();
+        if let Some(transaction) = &mut self.transaction {
+            transaction.changed = true;
+            self.redo.clear();
+        } else {
+            self.undo.push(before);
+            self.redo.clear();
+        }
         Ok(result)
     }
 
     pub fn undo(&mut self) -> bool {
+        self.end_transaction();
         if let Some(previous) = self.undo.pop() {
             self.redo
                 .push(std::mem::replace(&mut self.project, previous));
@@ -144,6 +182,7 @@ impl Editor {
     }
 
     pub fn redo(&mut self) -> bool {
+        self.end_transaction();
         if let Some(next) = self.redo.pop() {
             self.undo.push(std::mem::replace(&mut self.project, next));
             true
@@ -383,6 +422,40 @@ mod tests {
         assert_eq!(editor.project().pieces[&piece].name, "head");
         assert!(editor.redo());
         assert_eq!(editor.project().pieces[&piece].name, "renamed head");
+    }
+
+    #[test]
+    fn transaction_groups_many_commands_into_one_undo_step() {
+        let (mut editor, piece) = piece_editor();
+        let before = editor.project().clone();
+        editor.begin_transaction();
+        for x in 0..10 {
+            editor
+                .execute(Command::AddBead {
+                    target: VoxelObjectRef::Piece(piece),
+                    bead: Bead {
+                        position: GridPosition::new(x, 0, 0),
+                        color: Color::RED,
+                    },
+                })
+                .unwrap();
+        }
+        assert!(editor.end_transaction());
+        let after = editor.project().clone();
+
+        assert!(editor.undo());
+        assert_eq!(editor.project(), &before);
+        assert!(!editor.can_undo());
+        assert!(editor.redo());
+        assert_eq!(editor.project(), &after);
+    }
+
+    #[test]
+    fn empty_transaction_does_not_create_history() {
+        let (mut editor, _) = piece_editor();
+        editor.begin_transaction();
+        assert!(!editor.end_transaction());
+        assert!(!editor.can_undo());
     }
 
     #[test]

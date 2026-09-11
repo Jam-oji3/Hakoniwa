@@ -155,9 +155,11 @@ where
                     ))
                 });
             if undo_requested && self.editor.undo() {
+                self.piece_editor.finish_drag();
                 self.status = "操作を元に戻しました".into();
             }
             if redo_requested && self.editor.redo() {
+                self.piece_editor.finish_drag();
                 self.status = "操作をやり直しました".into();
             }
             ui.separator();
@@ -211,7 +213,7 @@ where
         });
         ui.separator();
 
-        let commands = {
+        let (commands, begin_transaction, mut end_transaction) = {
             let mut behavior = WorkspaceBehavior {
                 project: self.editor.project(),
                 selected: &mut self.selected,
@@ -223,14 +225,30 @@ where
                 perspective: &mut self.perspective,
                 close_requested: None,
                 commands: Vec::new(),
+                begin_transaction: false,
+                end_transaction: false,
             };
             self.workspace.ui(&mut behavior, ui);
             if let Some(tile_id) = behavior.close_requested {
                 self.workspace.tiles.set_visible(tile_id, false);
             }
-            behavior.commands
+            (
+                behavior.commands,
+                behavior.begin_transaction,
+                behavior.end_transaction,
+            )
         };
 
+        if !ui.input(|input| input.pointer.primary_down())
+            && self.piece_editor.drag_transaction_active
+        {
+            self.piece_editor.finish_drag();
+            end_transaction = true;
+        }
+
+        if begin_transaction {
+            self.editor.begin_transaction();
+        }
         for pending in commands {
             let deletes_selection = matches!(
                 &pending.command,
@@ -248,6 +266,9 @@ where
                 }
                 Err(error) => self.status = format!("編集できません: {error:?}"),
             }
+        }
+        if end_transaction {
+            self.editor.end_transaction();
         }
     }
 }
@@ -291,6 +312,8 @@ struct WorkspaceBehavior<'a> {
     perspective: &'a mut bool,
     close_requested: Option<egui_tiles::TileId>,
     commands: Vec<PendingCommand>,
+    begin_transaction: bool,
+    end_transaction: bool,
 }
 
 impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
@@ -317,6 +340,8 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
                     .get(&selected_piece_id(*self.selected).unwrap_or_default()),
                 self.piece_editor,
                 &mut self.commands,
+                &mut self.begin_transaction,
+                &mut self.end_transaction,
             ),
             WorkspacePane::AssemblyView => draw_preview(
                 ui,
@@ -456,6 +481,7 @@ struct PieceEditorState {
     tool: PieceTool,
     color: Color,
     last_dragged_cell: Option<GridPoint2d>,
+    drag_transaction_active: bool,
 }
 
 impl Default for PieceEditorState {
@@ -467,6 +493,7 @@ impl Default for PieceEditorState {
             tool: PieceTool::Pencil,
             color: Color::RED,
             last_dragged_cell: None,
+            drag_transaction_active: false,
         }
     }
 }
@@ -477,6 +504,12 @@ impl PieceEditorState {
         self.layout = PlateLayout::empty_piece();
         self.viewport = None;
         self.last_dragged_cell = None;
+        self.drag_transaction_active = false;
+    }
+
+    fn finish_drag(&mut self) {
+        self.last_dragged_cell = None;
+        self.drag_transaction_active = false;
     }
 
     fn ensure_piece(&mut self, piece: &Piece, size: egui::Vec2) {
@@ -1047,13 +1080,22 @@ fn draw_editor(
     piece: Option<&Piece>,
     state: &mut PieceEditorState,
     commands: &mut Vec<PendingCommand>,
+    begin_transaction: &mut bool,
+    end_transaction: &mut bool,
 ) {
     let Some(piece) = piece else {
+        if state.drag_transaction_active {
+            *end_transaction = true;
+        }
         state.reset();
         ui.label("ツリーからPieceを選択してください");
         return;
     };
 
+    if state.piece_id != Some(piece.id) && state.drag_transaction_active {
+        state.finish_drag();
+        *end_transaction = true;
+    }
     state.ensure_piece(piece, ui.available_size());
     ui.horizontal_wrapped(|ui| {
         ui.label(format!("{} · {:?}", piece.name, piece.plane));
@@ -1121,11 +1163,18 @@ fn draw_editor(
 
     let primary_down = ui.input(|input| input.pointer.primary_down());
     if !primary_down {
-        state.last_dragged_cell = None;
+        if state.drag_transaction_active {
+            state.finish_drag();
+            *end_transaction = true;
+        }
     } else if response.hovered()
         && pointer_cell.is_some()
         && pointer_cell != state.last_dragged_cell
     {
+        if !state.drag_transaction_active {
+            state.drag_transaction_active = true;
+            *begin_transaction = true;
+        }
         let cell = pointer_cell.expect("pointer cell was checked");
         state.last_dragged_cell = Some(cell);
         let position = unproject_position(piece.plane, cell);
