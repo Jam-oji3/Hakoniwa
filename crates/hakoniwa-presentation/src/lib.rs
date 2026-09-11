@@ -2,7 +2,7 @@ mod editor_2d;
 
 use eframe::egui;
 use glam::{Quat, Vec3};
-use hakoniwa_application::{Command, Editor, ProjectRepository};
+use hakoniwa_application::{ChangeSet, Command, Editor, ProjectRepository};
 use hakoniwa_domain::{
     Bead, Color, GridAxis, GridPosition, GridRotation, ObjectId, ObjectRef, Piece, Placement,
     Plane, Project, VoxelObjectRef,
@@ -44,6 +44,7 @@ pub struct HakoniwaApp<R: ProjectRepository> {
     piece_editor: PieceEditorState,
     tree_editor: TreeEditorState,
     assembly_editor: AssemblyEditorState,
+    render_adapter: AssemblyRenderAdapter,
     status: String,
     zoom: f32,
     orientation: Quat,
@@ -82,6 +83,7 @@ impl<R: ProjectRepository> HakoniwaApp<R> {
             piece_editor: PieceEditorState::default(),
             tree_editor: TreeEditorState::default(),
             assembly_editor: AssemblyEditorState::default(),
+            render_adapter: AssemblyRenderAdapter::default(),
             status: "ハンマーのMVPサンプルを読み込みました".into(),
             zoom: 1.0,
             orientation: Quat::from_rotation_x(-35.0_f32.to_radians())
@@ -143,6 +145,7 @@ where
                 self.selected = None;
                 self.piece_editor.reset();
                 self.assembly_editor.reset_project_view();
+                self.render_adapter.clear();
                 self.status = "ハンマーを作成しました".into();
             }
             let undo_requested = ui
@@ -165,10 +168,12 @@ where
                 });
             if undo_requested && self.editor.undo() {
                 self.piece_editor.finish_drag();
+                self.render_adapter.invalidate_all();
                 self.status = "操作を元に戻しました".into();
             }
             if redo_requested && self.editor.redo() {
                 self.piece_editor.finish_drag();
+                self.render_adapter.invalidate_all();
                 self.status = "操作をやり直しました".into();
             }
             ui.separator();
@@ -192,6 +197,7 @@ where
                         self.selected = None;
                         self.piece_editor.reset();
                         self.assembly_editor.reset_project_view();
+                        self.render_adapter.clear();
                         self.file_path = path.to_string_lossy().into_owned();
                         self.status = format!("読み込みました: {}", path.display());
                     }
@@ -230,6 +236,7 @@ where
                 piece_editor: &mut self.piece_editor,
                 tree_editor: &mut self.tree_editor,
                 assembly_editor: &mut self.assembly_editor,
+                render_adapter: &mut self.render_adapter,
                 zoom: &mut self.zoom,
                 orientation: &mut self.orientation,
                 pan: &mut self.pan,
@@ -267,6 +274,7 @@ where
             );
             match self.editor.execute(pending.command) {
                 Ok(result) => {
+                    self.render_adapter.apply_changes(&result.changes);
                     if pending.select_created && result.created_object.is_some() {
                         self.selected = result.created_object;
                     } else if deletes_selection {
@@ -318,6 +326,7 @@ struct WorkspaceBehavior<'a> {
     piece_editor: &'a mut PieceEditorState,
     tree_editor: &'a mut TreeEditorState,
     assembly_editor: &'a mut AssemblyEditorState,
+    render_adapter: &'a mut AssemblyRenderAdapter,
     zoom: &'a mut f32,
     orientation: &'a mut Quat,
     pan: &'a mut egui::Vec2,
@@ -361,6 +370,7 @@ impl egui_tiles::Behavior<WorkspacePane> for WorkspaceBehavior<'_> {
                 PreviewContext {
                     selected: self.selected,
                     editor: self.assembly_editor,
+                    render_adapter: self.render_adapter,
                     commands: &mut self.commands,
                     zoom: self.zoom,
                     orientation: self.orientation,
@@ -1640,6 +1650,7 @@ const fn plane_label(plane: Plane) -> &'static str {
 struct PreviewContext<'a> {
     selected: &'a mut Option<ObjectRef>,
     editor: &'a mut AssemblyEditorState,
+    render_adapter: &'a mut AssemblyRenderAdapter,
     commands: &'a mut Vec<PendingCommand>,
     zoom: &'a mut f32,
     orientation: &'a mut Quat,
@@ -1797,12 +1808,19 @@ fn draw_preview(ui: &mut egui::Ui, project: &Project, context: PreviewContext<'_
             })
         });
     let render_project = preview_project.as_ref().unwrap_or(project);
+    let mut preview_adapter = AssemblyRenderAdapter::default();
+    let render_adapter = if preview_project.is_some() {
+        &mut preview_adapter
+    } else {
+        context.render_adapter
+    };
     let painter = ui.painter().with_clip_rect(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::WHITE);
     let rendered = render_voxels(
         &painter,
         rect,
         render_project,
+        render_adapter,
         RenderOptions {
             selected: *context.selected,
             orientation: *context.orientation,
@@ -2762,6 +2780,134 @@ struct RenderFace {
     color: egui::Color32,
 }
 
+#[derive(Clone)]
+struct CachedVoxelObject {
+    object: ObjectRef,
+    visible: bool,
+    voxels: Vec<(GridPosition, Color)>,
+}
+
+#[derive(Clone, Default)]
+struct AssemblyRenderAdapter {
+    objects: BTreeMap<ObjectRef, CachedVoxelObject>,
+    dirty: BTreeSet<ObjectRef>,
+    invalidate_all: bool,
+    rebuild_count: usize,
+}
+
+impl AssemblyRenderAdapter {
+    fn clear(&mut self) {
+        self.objects.clear();
+        self.dirty.clear();
+        self.invalidate_all = false;
+    }
+
+    fn invalidate_all(&mut self) {
+        self.invalidate_all = true;
+    }
+
+    fn apply_changes(&mut self, changes: &ChangeSet) {
+        if changes
+            .changed_objects
+            .iter()
+            .any(|object| matches!(object, ObjectRef::Group(_)))
+        {
+            self.invalidate_all();
+            return;
+        }
+        self.dirty.extend(
+            changes
+                .changed_objects
+                .iter()
+                .filter_map(|object| match object {
+                    ObjectRef::Piece(_) | ObjectRef::Shape(_) => Some(*object),
+                    ObjectRef::Group(_) => None,
+                }),
+        );
+        self.dirty.extend(
+            changes
+                .dirty_piece_ids
+                .iter()
+                .map(|id| ObjectRef::Piece(*id)),
+        );
+    }
+
+    fn sync(&mut self, project: &Project) {
+        if self.invalidate_all {
+            self.clear();
+        }
+        self.objects.retain(|object, _| match object {
+            ObjectRef::Piece(id) => project.pieces.contains_key(id),
+            ObjectRef::Shape(id) => project.shapes.contains_key(id),
+            ObjectRef::Group(_) => false,
+        });
+
+        for piece in project.pieces.values() {
+            let object = ObjectRef::Piece(piece.id);
+            if self.objects.contains_key(&object) && !self.dirty.contains(&object) {
+                continue;
+            }
+            let voxels = piece
+                .beads
+                .iter()
+                .map(|(position, color)| {
+                    (
+                        transformed_world_position(
+                            project,
+                            piece.parent_group_id,
+                            piece.placement,
+                            *position,
+                        ),
+                        *color,
+                    )
+                })
+                .collect();
+            self.objects.insert(
+                object,
+                CachedVoxelObject {
+                    object,
+                    visible: piece.visible
+                        && group_chain_is_visible(project, piece.parent_group_id),
+                    voxels,
+                },
+            );
+            self.rebuild_count += 1;
+        }
+        for shape in project.shapes.values() {
+            let object = ObjectRef::Shape(shape.id);
+            if self.objects.contains_key(&object) && !self.dirty.contains(&object) {
+                continue;
+            }
+            let voxels = shape
+                .beads
+                .iter()
+                .map(|(position, color)| {
+                    (
+                        transformed_world_position(
+                            project,
+                            shape.parent_group_id,
+                            shape.placement,
+                            *position,
+                        ),
+                        *color,
+                    )
+                })
+                .collect();
+            self.objects.insert(
+                object,
+                CachedVoxelObject {
+                    object,
+                    visible: shape.visible
+                        && group_chain_is_visible(project, shape.parent_group_id),
+                    voxels,
+                },
+            );
+            self.rebuild_count += 1;
+        }
+        self.dirty.clear();
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RenderOptions {
     selected: Option<ObjectRef>,
@@ -2783,50 +2929,20 @@ fn render_voxels(
     painter: &egui::Painter,
     rect: egui::Rect,
     project: &Project,
+    adapter: &mut AssemblyRenderAdapter,
     options: RenderOptions,
 ) -> RenderOutput {
-    let visible_objects = project
-        .pieces
+    adapter.sync(project);
+    let visible_objects = adapter
+        .objects
         .values()
-        .filter(|piece| {
-            piece.visible
-                && group_chain_is_visible(project, piece.parent_group_id)
-                && isolation_includes(project, ObjectRef::Piece(piece.id), options.isolated)
+        .filter(|cached| {
+            cached.visible && isolation_includes(project, cached.object, options.isolated)
         })
-        .map(|piece| {
-            (
-                ObjectRef::Piece(piece.id),
-                piece.parent_group_id,
-                piece.placement,
-                &piece.beads,
-            )
-        })
-        .chain(
-            project
-                .shapes
-                .values()
-                .filter(|shape| {
-                    shape.visible
-                        && group_chain_is_visible(project, shape.parent_group_id)
-                        && isolation_includes(project, ObjectRef::Shape(shape.id), options.isolated)
-                })
-                .map(|shape| {
-                    (
-                        ObjectRef::Shape(shape.id),
-                        shape.parent_group_id,
-                        shape.placement,
-                        &shape.beads,
-                    )
-                }),
-        )
         .collect::<Vec<_>>();
     let occupied = visible_objects
         .iter()
-        .flat_map(|(_, parent_group_id, placement, beads)| {
-            beads.keys().map(|position| {
-                transformed_world_position(project, *parent_group_id, *placement, *position)
-            })
-        })
+        .flat_map(|cached| cached.voxels.iter().map(|(position, _)| *position))
         .collect::<BTreeSet<_>>();
     if occupied.is_empty() {
         return RenderOutput {
@@ -2859,13 +2975,13 @@ fn render_voxels(
         focal_distance: frame.span * 4.0,
     };
     let mut faces = Vec::new();
-    for (object, parent_group_id, placement, beads) in visible_objects {
-        for (position, color) in beads {
+    for cached in visible_objects {
+        for (position, color) in &cached.voxels {
             append_faces(
                 &mut faces,
                 rect.center(),
-                object,
-                transformed_world_position(project, parent_group_id, placement, *position),
+                cached.object,
+                *position,
                 *color,
                 &occupied,
                 &camera,
@@ -3611,6 +3727,54 @@ mod presentation_tests {
             ObjectRef::Piece(outside),
             Some(ObjectRef::Group(group))
         ));
+    }
+
+    #[test]
+    fn render_adapter_rebuilds_only_changed_objects() {
+        let mut project = Project::new("render cache");
+        let root = project.root_group_id();
+        let first = project
+            .create_piece(root, "first", Plane::Xy { z: 0 })
+            .unwrap();
+        let second = project
+            .create_piece(root, "second", Plane::Xy { z: 0 })
+            .unwrap();
+        for piece in [first, second] {
+            project
+                .add_bead(
+                    VoxelObjectRef::Piece(piece),
+                    Bead {
+                        position: GridPosition::ZERO,
+                        color: Color::RED,
+                    },
+                )
+                .unwrap();
+        }
+        let mut adapter = AssemblyRenderAdapter::default();
+        adapter.sync(&project);
+        assert_eq!(adapter.rebuild_count, 2);
+        adapter.sync(&project);
+        assert_eq!(adapter.rebuild_count, 2);
+
+        project
+            .add_bead(
+                VoxelObjectRef::Piece(first),
+                Bead {
+                    position: GridPosition::new(1, 0, 0),
+                    color: Color::RED,
+                },
+            )
+            .unwrap();
+        adapter.apply_changes(&ChangeSet {
+            changed_objects: BTreeSet::from([ObjectRef::Piece(first)]),
+            dirty_piece_ids: BTreeSet::from([first]),
+            nearby_positions: BTreeSet::new(),
+        });
+        adapter.sync(&project);
+
+        assert_eq!(adapter.rebuild_count, 3);
+        assert_eq!(adapter.objects[&ObjectRef::Piece(first)].voxels.len(), 2);
+        assert_eq!(adapter.objects[&ObjectRef::Piece(second)].voxels.len(), 1);
     }
 }
 

@@ -85,3 +85,11 @@
 - プレビューとギズモ状態はPresentationの一時状態とし、保存しない。
 - 1回のギズモドラッグまたは1回のG/R操作を、1回のUndo/Redo単位とする。
 - 取り消した操作はProjectとUndo/Redo履歴を変更しない。
+
+## 描画Adapterと更新範囲
+
+- Domain Objectからワールド座標のボクセル描画データへの変換は、Presentation内のAdapterへ分離する。
+- AdapterはPiece/Shape単位で描画データをキャッシュし、Applicationの`ChangeSet`で変更対象だけを無効化する。
+- Group変換、Undo/Redo、Projectの新規作成・読込では、階層影響を漏らさないため全キャッシュを無効化する。
+- 移動・回転プレビューは一時Adapterで描画し、確定前の状態を通常キャッシュへ混在させない。
+- カメラ依存の投影と可視面判定は毎フレーム導出し、Domainや保存データには保持しない。
