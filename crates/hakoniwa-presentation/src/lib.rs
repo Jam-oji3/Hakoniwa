@@ -3126,6 +3126,7 @@ fn render_voxels(
         for face in &mut faces[warning_start..] {
             face.pickable = false;
             face.warning = true;
+            face.color = warning_fill_color();
         }
     }
     faces.sort_by(|a, b| a.depth.total_cmp(&b.depth));
@@ -3145,6 +3146,10 @@ fn render_voxels(
         camera: Some(camera),
         camera_frame: Some(frame),
     }
+}
+
+fn warning_fill_color() -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(255, 45, 45, 72)
 }
 
 fn overlapping_voxel_positions(objects: &[&CachedVoxelObject]) -> BTreeSet<GridPosition> {
