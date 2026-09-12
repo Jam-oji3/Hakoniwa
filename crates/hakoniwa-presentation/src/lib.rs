@@ -2868,6 +2868,8 @@ struct CameraFrame {
 
 struct RenderFace {
     object: ObjectRef,
+    pickable: bool,
+    warning: bool,
     depth: f32,
     points: Vec<egui::Pos2>,
     world_points: [GridVertex; 4],
@@ -3055,6 +3057,7 @@ fn render_voxels(
             cached.visible && isolation_includes(project, cached.object, options.isolated)
         })
         .collect::<Vec<_>>();
+    let overlapping = overlapping_voxel_positions(&visible_objects);
     let occupied = visible_objects
         .iter()
         .flat_map(|cached| cached.voxels.iter().map(|(position, _)| *position))
@@ -3091,20 +3094,45 @@ fn render_voxels(
     };
     let mut faces = Vec::new();
     for cached in visible_objects {
+        let voxels = cached
+            .voxels
+            .iter()
+            .copied()
+            .filter(|(position, _)| !overlapping.contains(position))
+            .collect::<Vec<_>>();
         append_greedy_faces(
             &mut faces,
             rect.center(),
             cached.object,
-            &cached.voxels,
+            &voxels,
             &occupied,
             &camera,
         );
+    }
+    if !overlapping.is_empty() {
+        let warning_start = faces.len();
+        let warning_voxels = overlapping
+            .iter()
+            .map(|position| (*position, Color::RED))
+            .collect::<Vec<_>>();
+        append_greedy_faces(
+            &mut faces,
+            rect.center(),
+            ObjectRef::Group(project.root_group_id()),
+            &warning_voxels,
+            &occupied,
+            &camera,
+        );
+        for face in &mut faces[warning_start..] {
+            face.pickable = false;
+            face.warning = true;
+        }
     }
     faces.sort_by(|a, b| a.depth.total_cmp(&b.depth));
     paint_faces_as_one_mesh(painter, &faces);
     let selected_faces = faces
         .iter()
-        .filter(|face| object_is_selected(project, face.object, options.selected))
+        .filter(|face| face.pickable && object_is_selected(project, face.object, options.selected))
         .collect::<Vec<_>>();
     for edge in boundary_edges(&selected_faces) {
         painter.line_segment(
@@ -3117,6 +3145,22 @@ fn render_voxels(
         camera: Some(camera),
         camera_frame: Some(frame),
     }
+}
+
+fn overlapping_voxel_positions(objects: &[&CachedVoxelObject]) -> BTreeSet<GridPosition> {
+    let mut occupants = BTreeMap::<GridPosition, BTreeSet<ObjectRef>>::new();
+    for object in objects {
+        for (position, _) in &object.voxels {
+            occupants
+                .entry(*position)
+                .or_default()
+                .insert(object.object);
+        }
+    }
+    occupants
+        .into_iter()
+        .filter_map(|(position, objects)| (objects.len() > 1).then_some(position))
+        .collect()
 }
 
 fn boundary_edges(faces: &[&RenderFace]) -> Vec<[egui::Pos2; 2]> {
@@ -3294,7 +3338,7 @@ fn pick_rendered_object(faces: &[RenderFace], pointer: egui::Pos2) -> Option<Obj
     faces
         .iter()
         .rev()
-        .find(|face| point_in_convex_polygon(pointer, &face.points))
+        .find(|face| face.pickable && point_in_convex_polygon(pointer, &face.points))
         .map(|face| face.object)
 }
 
@@ -3308,20 +3352,120 @@ fn paint_faces_as_one_mesh(painter: &egui::Painter, faces: &[RenderFace]) {
 
 fn append_faces_to_mesh(mesh: &mut egui::Mesh, faces: &[RenderFace]) {
     for face in faces {
-        let first_vertex = mesh.vertices.len() as u32;
-        for point in &face.points {
-            mesh.vertices
-                .push(egui::epaint::Vertex::untextured(*point, face.color));
+        append_quad_to_mesh(mesh, &face.points, face.color);
+        if face.warning {
+            append_warning_hatching_to_mesh(mesh, face);
         }
-        mesh.indices.extend_from_slice(&[
-            first_vertex,
-            first_vertex + 1,
-            first_vertex + 2,
-            first_vertex,
-            first_vertex + 2,
-            first_vertex + 3,
-        ]);
     }
+}
+
+fn append_quad_to_mesh(mesh: &mut egui::Mesh, points: &[egui::Pos2], color: egui::Color32) {
+    let [first, second, third, fourth] = points else {
+        return;
+    };
+    let first_vertex = mesh.vertices.len() as u32;
+    for point in [first, second, third, fourth] {
+        mesh.vertices
+            .push(egui::epaint::Vertex::untextured(*point, color));
+    }
+    mesh.indices.extend_from_slice(&[
+        first_vertex,
+        first_vertex + 1,
+        first_vertex + 2,
+        first_vertex,
+        first_vertex + 2,
+        first_vertex + 3,
+    ]);
+}
+
+fn append_warning_hatching_to_mesh(mesh: &mut egui::Mesh, face: &RenderFace) {
+    const SPACING: f32 = 12.0;
+    let [top_left, top_right, bottom_right, bottom_left] = face.points.as_slice() else {
+        return;
+    };
+    let width = top_left
+        .distance(*top_right)
+        .max(bottom_left.distance(*bottom_right));
+    let height = top_left
+        .distance(*bottom_left)
+        .max(top_right.distance(*bottom_right));
+    let count = ((width + height) / SPACING).ceil().max(2.0) as usize;
+    for index in 0..=count {
+        let fraction = index as f32 / count as f32 * 2.0;
+        let (start, end) =
+            hatch_endpoints(*top_left, *top_right, *bottom_right, *bottom_left, fraction);
+        let direction = end - start;
+        if direction.length_sq() <= f32::EPSILON {
+            continue;
+        }
+        let offset = egui::vec2(-direction.y, direction.x).normalized() * 0.75;
+        append_quad_to_mesh(
+            mesh,
+            &[start - offset, end - offset, end + offset, start + offset],
+            egui::Color32::from_rgb(150, 0, 0),
+        );
+    }
+}
+
+fn hatch_endpoints(
+    top_left: egui::Pos2,
+    top_right: egui::Pos2,
+    bottom_right: egui::Pos2,
+    bottom_left: egui::Pos2,
+    fraction: f32,
+) -> (egui::Pos2, egui::Pos2) {
+    if fraction <= 1.0 {
+        (
+            interpolate_quad(
+                top_left,
+                top_right,
+                bottom_right,
+                bottom_left,
+                fraction,
+                0.0,
+            ),
+            interpolate_quad(
+                top_left,
+                top_right,
+                bottom_right,
+                bottom_left,
+                1.0,
+                1.0 - fraction,
+            ),
+        )
+    } else {
+        (
+            interpolate_quad(
+                top_left,
+                top_right,
+                bottom_right,
+                bottom_left,
+                1.0,
+                fraction - 1.0,
+            ),
+            interpolate_quad(
+                top_left,
+                top_right,
+                bottom_right,
+                bottom_left,
+                2.0 - fraction,
+                1.0,
+            ),
+        )
+    }
+}
+
+fn interpolate_quad(
+    top_left: egui::Pos2,
+    top_right: egui::Pos2,
+    bottom_right: egui::Pos2,
+    bottom_left: egui::Pos2,
+    u: f32,
+    v: f32,
+) -> egui::Pos2 {
+    let top = top_left.lerp(top_right, u);
+    let bottom = bottom_left.lerp(bottom_right, u);
+    top.lerp(bottom, v)
 }
 
 fn point_in_convex_polygon(point: egui::Pos2, polygon: &[egui::Pos2]) -> bool {
@@ -3564,6 +3708,8 @@ fn append_greedy_face(
     .clamp(0.35, 1.0);
     output.push(RenderFace {
         object,
+        pickable: true,
+        warning: false,
         depth: depth / 4.0,
         points,
         world_points,
@@ -3689,6 +3835,8 @@ mod presentation_tests {
         let faces = vec![
             RenderFace {
                 object: ObjectRef::Piece(1),
+                pickable: true,
+                warning: false,
                 depth: 0.0,
                 points: square.clone(),
                 world_points: test_world_points(0, 0, 10, 10),
@@ -3696,6 +3844,8 @@ mod presentation_tests {
             },
             RenderFace {
                 object: ObjectRef::Piece(2),
+                pickable: true,
+                warning: false,
                 depth: 1.0,
                 points: square,
                 world_points: test_world_points(0, 0, 10, 10),
@@ -3711,9 +3861,59 @@ mod presentation_tests {
     }
 
     #[test]
+    fn overlapping_voxels_are_detected_only_between_objects() {
+        let objects = vec![
+            CachedVoxelObject {
+                object: ObjectRef::Piece(1),
+                visible: true,
+                voxels: vec![
+                    (GridPosition::new(0, 0, 0), Color::RED),
+                    (GridPosition::new(1, 0, 0), Color::RED),
+                ],
+            },
+            CachedVoxelObject {
+                object: ObjectRef::Piece(2),
+                visible: true,
+                voxels: vec![
+                    (GridPosition::new(1, 0, 0), Color::BROWN),
+                    (GridPosition::new(2, 0, 0), Color::BROWN),
+                ],
+            },
+        ];
+        let visible = objects.iter().collect::<Vec<_>>();
+
+        assert_eq!(
+            overlapping_voxel_positions(&visible),
+            BTreeSet::from([GridPosition::new(1, 0, 0)])
+        );
+    }
+
+    #[test]
+    fn warning_faces_do_not_intercept_object_selection() {
+        let face = RenderFace {
+            object: ObjectRef::Group(0),
+            pickable: false,
+            warning: true,
+            depth: 1.0,
+            points: vec![
+                egui::pos2(0.0, 0.0),
+                egui::pos2(10.0, 0.0),
+                egui::pos2(10.0, 10.0),
+                egui::pos2(0.0, 10.0),
+            ],
+            world_points: test_world_points(0, 0, 10, 10),
+            color: egui::Color32::RED,
+        };
+
+        assert_eq!(pick_rendered_object(&[face], egui::pos2(5.0, 5.0)), None);
+    }
+
+    #[test]
     fn selection_outline_omits_edges_shared_by_neighboring_faces() {
         let left = RenderFace {
             object: ObjectRef::Piece(1),
+            pickable: true,
+            warning: false,
             depth: 0.0,
             points: vec![
                 egui::pos2(0.0, 0.0),
@@ -3726,6 +3926,8 @@ mod presentation_tests {
         };
         let right = RenderFace {
             object: ObjectRef::Piece(1),
+            pickable: true,
+            warning: false,
             depth: 0.0,
             points: vec![
                 egui::pos2(10.0, 0.0),
@@ -3751,6 +3953,8 @@ mod presentation_tests {
     fn selection_outline_omits_t_junctions_between_greedy_rectangles() {
         let left = RenderFace {
             object: ObjectRef::Piece(1),
+            pickable: true,
+            warning: false,
             depth: 0.0,
             points: vec![
                 egui::pos2(0.0, 0.0),
@@ -3763,6 +3967,8 @@ mod presentation_tests {
         };
         let top_right = RenderFace {
             object: ObjectRef::Piece(1),
+            pickable: true,
+            warning: false,
             depth: 0.0,
             points: vec![
                 egui::pos2(10.0, 0.0),
@@ -3775,6 +3981,8 @@ mod presentation_tests {
         };
         let bottom_right = RenderFace {
             object: ObjectRef::Piece(1),
+            pickable: true,
+            warning: false,
             depth: 0.0,
             points: vec![
                 egui::pos2(10.0, 10.0),
@@ -3878,6 +4086,8 @@ mod presentation_tests {
         let faces = vec![
             RenderFace {
                 object: ObjectRef::Piece(1),
+                pickable: true,
+                warning: false,
                 depth: 0.0,
                 points: vec![
                     egui::pos2(0.0, 0.0),
@@ -3890,6 +4100,8 @@ mod presentation_tests {
             },
             RenderFace {
                 object: ObjectRef::Piece(1),
+                pickable: true,
+                warning: false,
                 depth: 0.0,
                 points: vec![
                     egui::pos2(10.0, 0.0),

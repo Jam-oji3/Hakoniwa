@@ -40,6 +40,7 @@
 | M3 | 保存・読込 | `.ibcad` ZIP形式 | 保存→読込でDomainが等価 |
 | M4 | 最小UI・2D編集 | ツリー、Piece作成、2Dグリッド | Piece-firstで平面図案を作れる |
 | M5 | 3D表示・Assembly | 3Dプレビュー、配置、直交回転、選択 | 複数Pieceを組み立てられる |
+| M5.5 | ボクセル重複警告 | ワールド座標の重複検出、3D警告オーバーレイ | 重複セルを通常描画せず警告表示できる |
 | M6 | Shape-first・分割支援 | Shape編集とPiece化 | Shapeを手動・平面でPieceにできる |
 | M7 | 集計・パレット | 色選択、必要ビーズ数 | Piece/グループ/Projectで集計一致 |
 | M8 | PDF出力 | 図案、集計、連結情報、組立図 | 製作可能なPDFを出力できる |
@@ -56,6 +57,7 @@
 | M3 | 完了 | `.ibcad` v2、v1移行、異常系、決定的保存、継続編集を実装・検証済み |
 | M4 | 完了 | 階層ツリー、Command経由の2D編集、29×29プレート拡張、Undo/Redo、保存・読込を実装・検証済み |
 | M5 | 完了 | 3D選択同期、外周表示、階層変換、動的カメラ、フォーカス、分離表示、移動・回転ギズモ、G/Rモーダル操作、Greedy Meshingを含むObject単位の描画Adapterキャッシュを実装・検証済み |
+| M5.5 | 完了 | 可視Object間のワールド座標重複を検出し、重複セルを通常メッシュから除外して赤い斜線ハッチの警告オーバーレイとして描画。警告面は選択対象にしない。 |
 | M6 | 一部完了 | 平面Piece化とUndo/Redoを実装。Shape編集UIは未実装 |
 | M7 | 一部完了 | Piece単位の色別集計を実装。パレットUIと階層集計は未実装 |
 | M8 | 未着手 | PDF出力は未実装 |
@@ -249,19 +251,26 @@ Piece-firstで作成した複数Pieceを3D Assemblyとして組み立て、保�
 #### 実装すること
 
 1. 3D空間でShapeのBeadを配置・削除・塗り替えできるようにする。
+   - 編集対象以外のObjectもAssembly内の位置関係を保って参照表示する。
 2. 以下のPiece化Commandを実装する。
    - 手動で選択したBeadのPiece化
    - 選択面のPiece化
    - XY/XZ/YZ平面での分割支援
 3. Piece化時に、移動するBead、作られるPiece、残るShapeをプレビューする。
 4. Piece化後の形状を元位置・姿勢でAssemblyに配置する。
+5. Shapeから切り出したPieceが2D編集で生成元Shapeの同一平面上のボクセルを吸収できるようにする。
+   - 吸収はShapeからの削除とPieceへの追加を一つのUndo/Redo単位にする。
+   - 別Shape・別Piece・Piece平面外のボクセルは吸収しない。
 
 #### 確認項目
 
 - [ ] Shapeを自由なボクセル集合として編集できる。
 - [ ] 非平面選択をPiece化しようとすると理由付きで拒否される。
+- [ ] 3D View上で選択した平面ボクセル集合をPiece化できる。
 - [x] 平面選択をPiece化すると、Shapeから対象Beadが移り、新Pieceが生成される。
 - [x] Piece化をUndo/Redoできる。
+- [ ] Shapeから切り出したPieceの2D拡張で、生成元Shapeの該当ボクセルを色を保って吸収できる。
+- [ ] 吸収をUndo/Redoすると、ShapeとPieceの両方が同時に復元する。
 - [ ] Shapeが残るとPDF出力前検証が失敗する。
 - [x] ShapeをすべてPiece化すると出力可能になる。
 
