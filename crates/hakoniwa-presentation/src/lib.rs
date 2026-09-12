@@ -3149,7 +3149,7 @@ fn render_voxels(
 }
 
 fn warning_fill_color() -> egui::Color32 {
-    egui::Color32::from_rgba_unmultiplied(255, 45, 45, 72)
+    egui::Color32::TRANSPARENT
 }
 
 fn overlapping_voxel_positions(objects: &[&CachedVoxelObject]) -> BTreeSet<GridPosition> {
